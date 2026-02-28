@@ -59,7 +59,8 @@ QWEN_ENCODER_PATH = os.environ.get(
 )
 SIGLIP_MODEL_ID = os.environ.get(
     "SIGLIP_MODEL_ID", "google/siglip-base-patch16-224")
-HF_CACHE = os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+HF_CACHE = os.environ.get("HF_HOME", str(
+    Path.home() / ".cache" / "huggingface"))
 
 SIGLIP_DIM = 768
 QWEN_HIDDEN_DIM = 2560
@@ -74,7 +75,7 @@ def train_dpo_direction(
     h_negative: torch.Tensor,
     dim: int,
     betas: list[float] = [0.1, 0.3, 0.5, 1.0, 2.0],
-    steps: int = 5000,
+    steps: int = 500,
     lr: float = 5e-3,
     min_accuracy: float = 0.98,
     verbose: bool = True,
@@ -845,7 +846,7 @@ def generate_lens_from_text_pairs(
     target: str = "zimage",
     include_bridge: bool = True,
     output_dir: Optional[Path] = None,
-    dpo_steps: int = 5000,
+    dpo_steps: int = 500,
 ) -> Path:
     """Generate a lens from explicit positive/negative text pairs.
 
@@ -1167,7 +1168,7 @@ def generate_lens_sae(
     n_activation_prompts: int = 500,
     top_k: int = 30,
     refine_dpo: bool = True,
-    dpo_steps: int = 5000,
+    dpo_steps: int = 500,
     include_bridge: bool = True,
     output_dir: Optional[Path] = None,
     sae_save_path: Optional[Path] = None,
@@ -1465,7 +1466,7 @@ def generate_lens_sae_from_preset(
     sae_epochs: int = 200,
     top_k: int = 30,
     refine_dpo: bool = True,
-    dpo_steps: int = 5000,
+    dpo_steps: int = 500,
     output_dir: Optional[Path] = None,
     sae_save_path: Optional[Path] = None,
     sae_load_path: Optional[Path] = None,
@@ -1665,7 +1666,7 @@ CONCEPT_PRESETS = {
 def generate_lens_from_preset(
     concept: str,
     target: str = "zimage",
-    dpo_steps: int = 5000,
+    dpo_steps: int = 500,
     output_dir: Optional[Path] = None,
 ) -> Path:
     """Generate a lens from a built-in concept preset."""
@@ -1787,7 +1788,7 @@ Environment variables:
         "concept", help="Preset name (e.g. cinematic, ethereal, dark_moody)")
     p_auto.add_argument("--target", default="zimage",
                         choices=["zimage", "sd15"])
-    p_auto.add_argument("--steps", type=int, default=5000,
+    p_auto.add_argument("--steps", type=int, default=500,
                         help="DPO training steps")
     p_auto.add_argument("--output-dir", type=Path,
                         default=None, help="Override output directory")
@@ -1810,8 +1811,8 @@ Environment variables:
                        help="Number of diverse prompts for activation collection (default: 500)")
     p_sae.add_argument("--no-refine-dpo", action="store_true",
                        help="Skip DPO refinement (SAE-only direction)")
-    p_sae.add_argument("--dpo-steps", type=int, default=5000,
-                       help="DPO optimization steps (default: 5000)")
+    p_sae.add_argument("--dpo-steps", type=int, default=500,
+                       help="DPO optimization steps (default: 500)")
     p_sae.add_argument("--sae-save", type=Path, default=None,
                        help="Save trained SAE to this path for reuse")
     p_sae.add_argument("--sae-load", type=Path, default=None,
@@ -1827,7 +1828,7 @@ Environment variables:
                         help="Concept name for the lens")
     p_text.add_argument("--target", default="zimage",
                         choices=["zimage", "sd15"])
-    p_text.add_argument("--steps", type=int, default=5000)
+    p_text.add_argument("--steps", type=int, default=500)
     p_text.add_argument("--output-dir", type=Path, default=None)
 
     # ── few-shot ──
@@ -1854,7 +1855,7 @@ Environment variables:
                          choices=["zimage", "sd15"])
     p_batch.add_argument("--method", default="dpo", choices=["dpo", "sae"],
                          help="Training method: 'dpo' (fast) or 'sae' (interpretable, default: dpo)")
-    p_batch.add_argument("--steps", type=int, default=5000)
+    p_batch.add_argument("--steps", type=int, default=500)
     p_batch.add_argument("--sae-features", type=int, default=30,
                          help="Top SAE features to keep (sae method only)")
     p_batch.add_argument("--sae-save", type=Path, default=None,
