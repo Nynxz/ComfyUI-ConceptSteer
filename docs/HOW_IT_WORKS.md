@@ -55,11 +55,11 @@ The diffusion model's conditioning mechanism is additive by design. The text emb
 
 ### The Norm Trick
 
-We normalize the lens direction relative to the average token norm in the conditioning tensor. This means `strength=1.0` adds a perturbation roughly equal in magnitude to a typical token embedding. This makes the strength parameter intuitive and consistent across different prompts:
+We normalize the lens direction relative to the average token norm in the conditioning tensor, scaled down by 0.3× so that the perturbation doesn't overwhelm the signal. Without this scaling, `strength=1.0` would add a vector with the full average token norm to every token position — far too aggressive. With it, `strength=1.0` adds ~30% of a typical token norm, which produces a clearly visible but non-destructive effect:
 
-- `strength=0.3` → subtle influence
+- `strength=0.5` → subtle influence
 - `strength=1.0` → clearly present
-- `strength=2.0` → dominant
+- `strength=3.0` → dominant
 - `strength=-1.0` → steer **away** from the concept
 
 ---

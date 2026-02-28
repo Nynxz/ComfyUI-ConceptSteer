@@ -62,7 +62,7 @@ It works because text-to-image conditioning is injected via cross-attention, and
 ## Features
 
 - **No model reload** — drop a node into your workflow
-- **Small files** — each lens is ~10 KB of direction data (~14 MB with cross-modal bridge weights)
+- **Small files** — the direction vector itself is ~10 KB; full lens files are ~14 MB due to bundled cross-modal bridge weights
 - **Bidirectional** — positive strength adds concept, negative steers away
 - **Composable** — chain multiple lenses (though results from stacking are not always predictable)
 - **Strength control** — from subtle (0.1) to dominant (3.0+)
@@ -142,10 +142,10 @@ Generated lenses are saved to `lenses/` and automatically appear in the Concept 
 
 | Strength | Effect |
 |----------|--------|
-| 0.1 – 0.3 | Subtle nudge |
-| 0.5 – 1.0 | Clearly visible |
-| 1.5 – 3.0 | Strong push |
-| 3.0+ | Dominant |
+| 0.3 – 0.5 | Subtle nudge |
+| 1.0 – 1.5 | Clearly visible |
+| 2.0 – 4.0 | Strong push |
+| 5.0+ | Dominant (may distort) |
 | Negative | Steers away |
 
 ## Node: Train Lens (DPO)
@@ -162,7 +162,7 @@ Train a concept direction via Direct Preference Optimization from text descripti
 | positive_texts | String (multiline) | — | Texts embodying the concept (one per line) |
 | negative_texts | String (multiline) | — | Neutral texts without the concept (one per line) |
 | target | Combo | zimage | zimage (2560d) or sd15 (768d) |
-| dpo_steps | Int | 5000 | Optimization steps |
+| dpo_steps | Int | 500 | Optimization steps |
 | encoder_path | String | "" | Path to Qwen 3.4B safetensors |
 | output_dir | String | "" | Override output directory |
 
@@ -183,7 +183,7 @@ Train an interpretable concept lens via Sparse Autoencoder decomposition of the 
 | sae_features | Int | 30 | Top-K features to keep |
 | n_prompts | Int | 500 | Diverse prompts for activation collection |
 | refine_dpo | Boolean | True | Blend with DPO direction |
-| dpo_steps | Int | 5000 | DPO optimization steps |
+| dpo_steps | Int | 500 | DPO optimization steps |
 | sae_save_path | String | "" | Save SAE for reuse |
 | sae_load_path | String | "" | Load pre-trained SAE |
 | encoder_path | String | "" | Path to Qwen 3.4B |
