@@ -18,6 +18,12 @@ Nodes:
     - Lens Inspect: Visualize a lens's internal structure and features
     - Activation Probe: Compare conditioning before/after steering
     - Lens Compare: Side-by-side comparison of two concept lenses
+
+  Feature Surgery:
+    - Train SAE: Train a standalone SAE (required for Feature Map/Gate)
+    - Feature Dictionary: Build a lookup of what each SAE feature responds to
+    - Feature Map: Visualize SAE feature activations in conditioning
+    - Feature Gate: Suppress or amplify individual SAE features
 """
 
 from comfy_api.latest import ComfyExtension, io
@@ -28,6 +34,10 @@ from .nodes.ConceptTrainFewShot import ConceptTrainFewShotNode
 from .nodes.ConceptLensInspect import ConceptLensInspectNode
 from .nodes.ConceptActivationProbe import ConceptActivationProbeNode
 from .nodes.ConceptLensCompare import ConceptLensCompareNode
+from .nodes.ConceptFeatureMap import ConceptFeatureMapNode
+from .nodes.ConceptFeatureGate import ConceptFeatureGateNode
+from .nodes.ConceptTrainSAEOnly import ConceptTrainSAEOnlyNode
+from .nodes.ConceptFeatureDict import ConceptFeatureDictNode
 
 
 class ConceptSteerExtension(ComfyExtension):
@@ -43,6 +53,11 @@ class ConceptSteerExtension(ComfyExtension):
             ConceptLensInspectNode,
             ConceptActivationProbeNode,
             ConceptLensCompareNode,
+            # Feature Surgery
+            ConceptTrainSAEOnlyNode,
+            ConceptFeatureDictNode,
+            ConceptFeatureMapNode,
+            ConceptFeatureGateNode,
         ]
 
 

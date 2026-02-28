@@ -202,8 +202,8 @@ class ConceptSteerNode(io.ComfyNode):
                     max=10.0,
                     step=0.05,
                     tooltip=(
-                        "Steering strength. 1.0 = perturbation matches average "
-                        "token norm. Negative values steer AWAY from the concept."
+                        "Steering strength. 1.0 = moderate, clearly visible effect. "
+                        "Negative values steer AWAY from the concept."
                     ),
                 ),
                 io.Boolean.Input(
@@ -302,7 +302,12 @@ class ConceptSteerNode(io.ComfyNode):
             steered = cond_tensor.clone()
 
             if normalize:
-                # Scale relative to average active token norm
+                # Scale relative to average active token norm.
+                # The scaling factor (0.3) is chosen so that strength=1.0
+                # produces a visible but non-destructive effect. Without it,
+                # strength=1.0 adds a perturbation equal to the full average
+                # token norm at every position, which overwhelms the signal.
+                NORM_SCALE = 0.3
                 token_norms = steered.norm(dim=-1)  # [B, tokens]
                 active_mask = token_norms > 0.01
                 if active_mask.any():
@@ -310,7 +315,7 @@ class ConceptSteerNode(io.ComfyNode):
                 else:
                     avg_norm = token_norms.mean()
 
-                delta = strength * avg_norm * unit_dir  # [dim]
+                delta = strength * NORM_SCALE * avg_norm * unit_dir  # [dim]
             else:
                 delta = strength * proj_dir  # [dim]
 

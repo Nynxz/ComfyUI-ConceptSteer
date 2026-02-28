@@ -142,7 +142,7 @@ class ConceptTrainSAENode(io.ComfyNode):
                 ),
                 io.Int.Input(
                     "dpo_steps",
-                    default=5000,
+                    default=500,
                     min=500,
                     max=20000,
                     step=500,
