@@ -18,7 +18,7 @@ A concept lens is a direction vector in the text encoder's embedding space. Addi
 ## Features
 
 - **Instant application** — no model reload, just drop a node into your workflow
-- **Tiny files** — each lens is ~14 MB (vs 50-300 MB LoRAs)
+- **Tiny files** — each lens is ~10 KB of direction data (vs 50-300 MB LoRAs)
 - **Bidirectional** — positive strength = more concept, negative = anti-concept
 - **Composable** — chain multiple lenses for combined effects
 - **Strength control** — from subtle nudge (0.1) to dominant (3.0+)
@@ -38,18 +38,34 @@ git clone https://github.com/nynxz/comfyui-conceptsteer.git
 # Restart ComfyUI
 ```
 
-## Included Lenses
+## Quick Start — Generate Your First Lens
 
-The package ships with pre-trained concept lenses in the `lenses/` directory:
+No pre-trained lenses are shipped. Generate them locally in ~30 seconds:
 
-| Lens | Style | Dimension |
-|------|-------|-----------|
-| cinematic | Hollywood dramatic lighting & composition | 2560d |
-| ethereal | Dreamy, soft, luminous otherworldly quality | 2560d |
-| dark_moody | High contrast, deep shadows, emotional intensity | 2560d |
-| vintage_film | Analog film grain, warm tones, light leaks | 2560d |
-| minimalist | Clean, sparse, negative space, restrained palette | 2560d |
-| vibrant_pop | Highly saturated, bold colors, graphic punch | 2560d |
+```bash
+cd ComfyUI/custom_nodes/comfyui-conceptsteer
+
+# Generate a single lens
+python tools/lens_factory.py auto cinematic --target zimage
+
+# Generate all 6 presets at once
+python tools/lens_factory.py batch-all --target zimage
+```
+
+Or use the **Train Lens** nodes directly inside ComfyUI — no terminal needed.
+
+### Available Presets
+
+| Preset | Style |
+|--------|-------|
+| cinematic | Hollywood dramatic lighting & composition |
+| ethereal | Dreamy, soft, luminous otherworldly quality |
+| dark_moody | High contrast, deep shadows, emotional intensity |
+| vintage_film | Analog film grain, warm tones, light leaks |
+| minimalist | Clean, sparse, negative space, restrained palette |
+| vibrant_pop | Highly saturated, bold colors, graphic punch |
+
+Generated lenses are saved to `lenses/` and automatically appear in the Concept Steer node dropdown.
 
 ## Node: Concept Steer
 
@@ -62,7 +78,7 @@ The package ships with pre-trained concept lenses in the `lenses/` directory:
 | strength | Float | 1.0 | -10.0 to 10.0. Negative = anti-concept |
 | normalize | Boolean | True | Scale relative to token norms |
 | active_tokens_only | Boolean | True | Only modify non-padding tokens |
-| custom_lens_path | String | "" | Override: absolute path to .pt file |
+| custom_lens_path | String | "" | Override: absolute path to a lens file |
 
 ### Outputs
 

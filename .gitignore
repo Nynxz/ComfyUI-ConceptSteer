@@ -24,5 +24,12 @@ env/
 .DS_Store
 Thumbs.db
 
+# Trained lens files (generated locally, not shipped)
+*.pt
+lenses/**/*.pt
+
+# SAE checkpoints
+*.sae
+
 # Node modules (ComfyUI JS)
 node_modules/
