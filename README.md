@@ -2,6 +2,21 @@
 
 Steer image generation toward (or away from) learned aesthetic concepts using **direction vectors** extracted via Sparse Autoencoder feature decomposition and DPO optimization. No LoRA, no fine-tuning, no extra model weights — just a single vector that nudges the conditioning toward your desired style.
 
+<table>
+<tr>
+<td align="center"><b>Without Concept Steer</b></td>
+<td align="center"><b>With Concept Steer</b></td>
+</tr>
+<tr>
+<td><img src="assets/z-image_01190_.png" width="400" alt="Without concept steering"></td>
+<td><img src="assets/z-image_01191_.png" width="400" alt="With concept steering applied"></td>
+</tr>
+<tr>
+<td align="center"><em>Same prompt, no steering</em></td>
+<td align="center"><em>Same prompt + <a href="docs/EXAMPLES.md#vintage-film">vintage film</a> lens (strength 0.42)</em></td>
+</tr>
+</table>
+
 ## What Are Concept Lenses?
 
 A concept lens is a direction vector in the text encoder's embedding space. Adding it to the conditioning tensor during image generation steers the output toward a concept like "cinematic," "ethereal," or "vintage film" — without changing your prompt.
