@@ -6,16 +6,41 @@ This is an engineering application of existing research (steering vectors, SAEs,
 
 <table>
 <tr>
-<td align="center"><b>Without Concept Steer</b></td>
-<td align="center"><b>With Concept Steer</b></td>
+<td align="center"><b>Base</b></td>
+<td align="center"><b><a href="docs/EXAMPLES.md#vintage-film">Vintage Film</a> Lens</b></td>
 </tr>
 <tr>
-<td><img src="assets/z-image_01190_.png" width="400" alt="Without concept steering"></td>
-<td><img src="assets/z-image_01191_.png" width="400" alt="With concept steering applied"></td>
+<td><img src="assets/base_1.png" width="400" alt="Base generation"></td>
+<td><img src="assets/steered_1.png" width="400" alt="With vintage film lens"></td>
 </tr>
 <tr>
-<td align="center"><em>Same prompt, no steering</em></td>
-<td align="center"><em>Same prompt + <a href="docs/EXAMPLES.md#vintage-film">vintage film</a> lens (strength 0.42)</em></td>
+<td><img src="assets/base_2.png" width="400" alt="Base generation"></td>
+<td><img src="assets/steered_2.png" width="400" alt="With vintage film lens"></td>
+</tr>
+<tr>
+<td align="center"><b>Base</b></td>
+<td align="center"><b><a href="docs/EXAMPLES.md#custom-concept-ideas">Cyberpunk</a> Lens</b></td>
+</tr>
+<tr>
+<td><img src="assets/base_3.png" width="400" alt="Base generation"></td>
+<td><img src="assets/steered_3.png" width="400" alt="With cyberpunk lens"></td>
+</tr>
+</table>
+
+**Same prompt, three lenses** — one base image steered in different directions:
+
+<table>
+<tr>
+<td align="center"><b>Base</b></td>
+<td align="center"><b><a href="docs/EXAMPLES.md#vintage-film">Vintage Film</a></b></td>
+<td align="center"><b><a href="docs/EXAMPLES.md#dark-moody">Dark Moody</a></b></td>
+<td align="center"><b><a href="docs/EXAMPLES.md#custom-concept-ideas">Cyberpunk</a></b></td>
+</tr>
+<tr>
+<td><img src="assets/bottle_base.png" width="200" alt="Base"></td>
+<td><img src="assets/bottle_vintage.png" width="200" alt="Vintage film"></td>
+<td><img src="assets/bottle_dark.png" width="200" alt="Dark moody"></td>
+<td><img src="assets/bottle_cyber.png" width="200" alt="Cyberpunk"></td>
 </tr>
 </table>
 
