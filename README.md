@@ -1,6 +1,8 @@
-# Concept Steer — Concept Steering for ComfyUI
+# Concept Steer — Conditioning Vectors for ComfyUI
 
-Steer image generation toward (or away from) learned aesthetic concepts using **direction vectors** extracted via Sparse Autoencoder feature decomposition and DPO optimization. No LoRA, no fine-tuning, no extra model weights — just a single vector that nudges the conditioning toward your desired style.
+Add direction vectors to text encoder conditioning to bias image generation toward aesthetic concepts. Based on the [Linear Representation Hypothesis](https://arxiv.org/abs/2310.15154) — the observation that concepts are encoded as linear directions in transformer hidden states.
+
+This is an engineering application of existing research (steering vectors, SAEs, contrastive probing) packaged as ComfyUI nodes. Nothing here is novel — see [Attribution](#attribution) for the actual research this builds on.
 
 <table>
 <tr>
@@ -17,9 +19,9 @@ Steer image generation toward (or away from) learned aesthetic concepts using **
 </tr>
 </table>
 
-## What Are Concept Lenses?
+## What Is This?
 
-A concept lens is a direction vector in the text encoder's embedding space. Adding it to the conditioning tensor during image generation steers the output toward a concept like "cinematic," "ethereal," or "vintage film" — without changing your prompt.
+A "concept lens" is a single direction vector (2560d for Qwen, 768d for SigLIP) trained to separate concept-embodying text embeddings from neutral ones. At inference, this vector is added to the conditioning tensor before it reaches the diffusion model — biasing generation toward (or away from) the concept.
 
 ```
 [CLIP Text Encode] → [Concept Steer] → [KSampler]
@@ -28,16 +30,26 @@ A concept lens is a direction vector in the text encoder's embedding space. Addi
                     strength: 1.0
 ```
 
-**Think of it as an invisible prompt modifier** the model can feel but the user never has to type.
+It works because text-to-image conditioning is injected via cross-attention, and adding a direction to the embedding before projection is equivalent to adding a bias term across all cross-attention layers. The effect is a consistent stylistic push without altering the prompt.
+
+**This is not a replacement for LoRAs or fine-tuning.** It's a lightweight, composable alternative for broad aesthetic nudges. For fine-grained style transfer or specific subject fidelity, LoRAs remain more effective.
 
 ## Features
 
-- **Instant application** — no model reload, just drop a node into your workflow
-- **Tiny files** — each lens is ~10 KB of direction data (vs 50-300 MB LoRAs)
-- **Bidirectional** — positive strength = more concept, negative = anti-concept
-- **Composable** — chain multiple lenses for combined effects
-- **Strength control** — from subtle nudge (0.1) to dominant (3.0+)
-- **Works with Z Image Turbo** (Qwen 3.4B / 2560d) and SD 1.5 (SigLIP / 768d)
+- **No model reload** — drop a node into your workflow
+- **Small files** — each lens is ~10 KB of direction data (~14 MB with cross-modal bridge weights)
+- **Bidirectional** — positive strength adds concept, negative steers away
+- **Composable** — chain multiple lenses (though results from stacking are not always predictable)
+- **Strength control** — from subtle (0.1) to dominant (3.0+)
+- **Currently supports** Z Image Turbo (Qwen 3.4B / 2560d) and SD 1.5 (SigLIP / 768d)
+
+## Limitations
+
+- **Broad concepts only** — works well for general aesthetics (cinematic, vintage, moody) but not for specific subjects, characters, or fine-grained styles. It's adding a single vector to every token, so it can't encode spatially-varying or compositionally-complex concepts.
+- **Prompt interference** — the direction is added regardless of prompt content. If your prompt already describes the concept, stacking a lens on top can overshoot or create artifacts.
+- **Training data sensitivity** — with only 10 text pairs, the direction can overfit to incidental correlations in the training texts rather than the intended concept. Carefully crafted contrastive pairs matter a lot.
+- **Not interpretable by default** — DPO lenses are opaque direction vectors. SAE lenses record which sparse features they use, but without a feature labeling pipeline those indices are just numbers.
+- **Limited model support** — currently only tested with Z Image Turbo and SD 1.5. Other architectures may use non-linear conditioning injection where adding a direction doesn't transfer cleanly.
 
 ## Installation
 
@@ -53,14 +65,14 @@ git clone https://github.com/nynxz/comfyui-conceptsteer.git
 # Restart ComfyUI
 ```
 
-## Quick Start — Generate Your First Lens
+## Quick Start
 
-No pre-trained lenses are shipped. Generate them locally in ~30 seconds:
+No pre-trained lenses are shipped. Generate them locally (~30 seconds for DPO, ~5 minutes for SAE):
 
 ```bash
 cd ComfyUI/custom_nodes/comfyui-conceptsteer
 
-# Generate a single lens
+# Generate a single lens (DPO — fast)
 python tools/lens_factory.py auto cinematic --target zimage
 
 # Generate all 6 presets at once
@@ -71,14 +83,14 @@ Or use the **Train Lens** nodes directly inside ComfyUI — no terminal needed.
 
 ### Available Presets
 
-| Preset | Style |
-|--------|-------|
-| cinematic | Hollywood dramatic lighting & composition |
-| ethereal | Dreamy, soft, luminous otherworldly quality |
-| dark_moody | High contrast, deep shadows, emotional intensity |
-| vintage_film | Analog film grain, warm tones, light leaks |
-| minimalist | Clean, sparse, negative space, restrained palette |
-| vibrant_pop | Highly saturated, bold colors, graphic punch |
+| Preset | Description |
+|--------|-------------|
+| cinematic | Dramatic lighting, shallow depth of field, film-like composition |
+| ethereal | Soft focus, luminous quality, dreamy atmosphere |
+| dark_moody | High contrast, deep shadows, low-key lighting |
+| vintage_film | Warm color cast, grain texture, analog film characteristics |
+| minimalist | Negative space, sparse composition, restrained palette |
+| vibrant_pop | High saturation, bold colors, graphic contrast |
 
 Generated lenses are saved to `lenses/` and automatically appear in the Concept Steer node dropdown.
 
@@ -168,13 +180,13 @@ Train a concept lens from example images using SigLIP embeddings.
 
 **Output**: `lens_path` (String) — absolute path to the saved lens file.
 
-## Interpretability Nodes
+## Debugging / Inspection Nodes
 
-These nodes help you understand what's happening inside the steering process — which concepts are being pushed, how much each token changes, and how lenses relate to each other.
+Nodes for examining what the steering actually does to your conditioning. Useful for verifying lenses work as expected and understanding failure modes.
 
 ### Node: Lens Inspect
 
-Visualize a lens's internal structure: weight distributions, top direction components, SAE feature breakdown, and training metadata.
+Dumps a lens's internal structure: weight distribution, top components, SAE feature breakdown (if applicable), and training metadata.
 
 ```
 [Lens Inspect] → IMAGE (multi-panel chart) + STRING (summary)
@@ -185,17 +197,11 @@ Visualize a lens's internal structure: weight distributions, top direction compo
 | lens | Dropdown | None | Select a lens to inspect |
 | custom_lens_path | String | "" | Override: absolute path |
 
-**Outputs**: `chart` (IMAGE) — multi-panel visualization, `summary` (STRING) — text report of lens properties.
-
-**What you'll see:**
-- Weight distribution histogram (how sparse/dense the direction is)
-- Top-30 largest weight components with their indices
-- SAE feature activations (if SAE lens) — which interpretable features define the concept
-- Stats: dimensionality, norm, sparsity, training accuracy
+**Outputs**: `chart` (IMAGE) — multi-panel visualization, `summary` (STRING) — text summary.
 
 ### Node: Activation Probe
 
-Compare conditioning BEFORE and AFTER steering to see exactly how the lens affects each token.
+Compare conditioning before and after steering to see per-token changes in magnitude and direction.
 
 ```
 [CLIP Text Encode] → original ──→ [Activation Probe] ←── steered ← [Concept Steer]
@@ -209,17 +215,11 @@ Compare conditioning BEFORE and AFTER steering to see exactly how the lens affec
 | steered | CONDITIONING | — | Conditioning after steering |
 | label | String | "" | Optional label for the chart |
 
-**Outputs**: `chart` (IMAGE) — 4-panel analysis, `analysis` (STRING) — metrics.
-
-**What you'll see:**
-- Per-token cosine similarity (how much each token changed direction)
-- Per-token perturbation magnitude (how much each token was pushed)
-- Token norm comparison (original vs steered side by side)
-- Summary statistics with steering intensity assessment
+**Outputs**: `chart` (IMAGE) — 4-panel analysis (cosine similarity, perturbation magnitude, norm comparison), `analysis` (STRING) — metrics.
 
 ### Node: Lens Compare
 
-Side-by-side comparison of two concept lenses to understand their relationship.
+Cosine similarity and weight overlap between two lenses. Helps determine whether chaining them will produce combined or redundant effects.
 
 | Input | Type | Default | Description |
 |-------|------|---------|-------------|
@@ -230,48 +230,40 @@ Side-by-side comparison of two concept lenses to understand their relationship.
 
 **Outputs**: `chart` (IMAGE) — comparison panels, `analysis` (STRING) — relationship report.
 
-**What you'll see:**
-- Weight distribution overlays (how the two lenses differ)
-- Top weight components side by side
-- SAE feature overlap (if both are SAE lenses) — Venn-style chart
-- Composability assessment (cosine similarity, orthogonality ratio)
-- Whether chaining the two lenses will produce combined or redundant effects
-
 ## Creating Custom Lenses
 
-Use the included `lens_factory.py` tool to create your own lenses:
+Use the included `lens_factory.py` CLI to create lenses:
 
 ```bash
-# SAE + DPO (recommended — interpretable & robust)
-python tools/lens_factory.py sae cinematic --target zimage
-
-# SAE only (no DPO refinement)
-python tools/lens_factory.py sae cinematic --no-refine-dpo
-
 # DPO only (fast, ~30s per lens)
 python tools/lens_factory.py auto cinematic --target zimage
+
+# SAE + DPO (slower, records which sparse features define the concept)
+python tools/lens_factory.py sae cinematic --target zimage
+
+# SAE without DPO refinement
+python tools/lens_factory.py sae cinematic --no-refine-dpo
 
 # From custom text pairs
 python tools/lens_factory.py text-pairs pairs.json --concept mystyle --target zimage
 
-# From example images (few-shot)
+# From example images (few-shot, SigLIP-based)
 python tools/lens_factory.py few-shot ./my_style_images/ --concept my_style
 
-# Generate all presets with SAE + DPO
-python tools/lens_factory.py batch-all --target zimage --method sae
-
-# Reuse a trained SAE across concepts (saves time)
+# Reuse a trained SAE across concepts (skips the expensive training step)
 python tools/lens_factory.py sae cinematic --sae-save ./my_sae.pt
 python tools/lens_factory.py sae ethereal --sae-load ./my_sae.pt
 ```
 
-### SAE vs DPO
+### DPO vs SAE
 
-| Method | Speed | What You Get |
-|--------|-------|-------------|
-| `auto` (DPO) | ~30s/lens | Opaque but effective direction |
-| `sae` | ~5min/lens | Interpretable features + optional DPO blend |
-| `sae --sae-load` | ~30s/lens | Reuse cached SAE, fast feature extraction |
+| Method | Speed | Notes |
+|--------|-------|-------|
+| `auto` (DPO) | ~30s/lens | Trains a separating hyperplane on output embeddings. Fast, opaque. |
+| `sae` | ~5min/lens | Hooks into residual stream, decomposes into sparse features, finds differential ones. Records feature indices in metadata. |
+| `sae --sae-load` | ~30s/lens | Reuses a cached SAE — only the feature extraction step runs. |
+
+SAE mode is slower because it collects ~15k activation vectors from 500 diverse prompts and trains an autoencoder with 8x expansion before doing feature extraction. The interpretability payoff is that you get a list of specific SAE feature indices that define the concept, though without a feature labeling pipeline those indices aren't human-readable.
 
 ### Text Pairs Format
 
@@ -284,41 +276,54 @@ python tools/lens_factory.py sae ethereal --sae-load ./my_sae.pt
 ]
 ```
 
-10 pairs is sufficient for strong results. The positive text should richly embody the concept; the negative should describe a **similar scene** without the concept.
+10 pairs works for broad concepts. The negative text should describe a **similar scene** without the concept — this forces the direction to capture the style, not the content. Bad pairs (e.g., "cinematic mountain" vs "cat on couch") will learn scene differences instead.
 
 ## How It Works
 
-See [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for the full technical write-up.
+See [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for the full technical details.
 
 **Short version:**
 
-Two lens extraction methods are available:
+### DPO Mode
 
-### SAE Mode (Interpretable)
+1. Encode positive/negative text pairs through the text encoder (Qwen 3.4B or SigLIP)
+2. Optimize a unit vector using a DPO-adapted loss to maximally separate positive from negative embeddings (sweep beta, pick best min-margin)
+3. At inference: add the direction to every active token position, scaled by `strength × average_token_norm`
 
-1. Hook into the text encoder's **residual stream** at layer 22 (~60% depth)
+This is essentially training a linear classifier. With 10 well-crafted contrastive pairs, DPO typically achieves 100% separation.
+
+### SAE Mode
+
+1. Hook into the text encoder's residual stream at layer 22 (~60% depth)
 2. Collect token-level activations from 500 diverse prompts
-3. Train a **Sparse Autoencoder** (8x expansion → 20,480 features) to decompose activations into interpretable features
-4. Run contrastive concept texts through the model + SAE
-5. Find which features fire differentially (top-K by magnitude)
-6. Reconstruct a clean direction from those features via `decode_sparse()` (bias-free)
-7. Optionally blend with a DPO-refined direction for robust separation
+3. Train a Sparse Autoencoder (8x expansion → 20,480 features) on those activations
+4. Run contrastive concept texts through the model + SAE, find features that fire differentially
+5. Reconstruct a direction from the top-K features via bias-free decoding
+6. Optionally blend with a DPO direction for better separation
 
-SAE lenses include metadata showing exactly which features define the concept — making them interpretable and debuggable.
+The SAE approach follows [Bricken et al. (2023)](https://transformer-circuits.pub/2023/monosemantic-features/index.html). The resulting direction is built from identifiable sparse features rather than an opaque optimization target.
 
-### DPO Mode (Fast)
+**Why this works at all:** text encoders in image generation models represent concepts as approximately linear directions in their hidden states. The diffusion model's conditioning is injected via cross-attention — adding a direction to the embedding adds a consistent bias to the attention computation. Z Image Turbo's `cap_embedder` is a linear layer (2560→3840), so the direction passes through without distortion.
 
-1. Encode positive/negative text pairs through the text encoder
-2. Optimize a unit vector in embedding space using Direct Preference Optimization to maximally separate the concept from its absence
-3. At inference: add the direction to every active token position, scaled by strength × average token norm
+## Attribution
 
-Both work because modern text encoders represent concepts as linear directions in their hidden states (the Linear Representation Hypothesis), and the diffusion model's conditioning mechanism is additive by design.
+This is an integration of existing research into a practical tool. The underlying ideas belong to:
+
+- **Linear Representation Hypothesis**: Nanda et al. (2023), Park et al. (2024)
+- **Steering Vectors / Activation Addition**: Turner et al. (2023)
+- **Concept Activation Vectors (TCAVs)**: Kim et al. (ICML 2018)
+- **DPO Loss**: Rafailov et al. (2023)
+- **Sparse Autoencoders**: Bricken et al. (Anthropic, 2023)
+- **Representation Engineering**: Zou et al. (2023)
+
+Built by [nynxz](https://github.com/nynxz) with significant help from Claude (Anthropic).
 
 ## Requirements
 
 - ComfyUI (latest)
 - PyTorch (comes with ComfyUI)
-- For lens creation: `transformers`, `safetensors` (via `pip install transformers safetensors`)
+- For lens creation: `transformers`, `safetensors` (`pip install transformers safetensors`)
+- For SAE/DPO training with Qwen: ~10 GB VRAM
 
 ## License
 
