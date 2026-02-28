@@ -57,8 +57,9 @@ QWEN_ENCODER_PATH = os.environ.get(
     "QWEN_ENCODER_PATH",
     "",  # User must set this or pass --encoder-path
 )
-SIGLIP_MODEL_ID = os.environ.get("SIGLIP_MODEL_ID", "google/siglip-base-patch16-224")
-HF_CACHE = os.environ.get("HF_HOME", "/tmp/hf_cache")
+SIGLIP_MODEL_ID = os.environ.get(
+    "SIGLIP_MODEL_ID", "google/siglip-base-patch16-224")
+HF_CACHE = os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
 
 SIGLIP_DIM = 768
 QWEN_HIDDEN_DIM = 2560
@@ -112,7 +113,8 @@ def train_dpo_direction(
             d = torch.randn(dim, device=DEVICE, requires_grad=True)
             d.data = F.normalize(d.data, dim=0)
             opt = torch.optim.Adam([d], lr=lr)
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=steps)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                opt, T_max=steps)
 
             best_loss = float("inf")
             for step in range(steps):
@@ -141,10 +143,12 @@ def train_dpo_direction(
                 "final_loss": best_loss,
             }
             if verbose:
-                print(f"    beta={beta:.1f}: acc={acc:.0%}  mean={mean_m:+.3f}  min={min_m:+.3f}")
+                print(
+                    f"    beta={beta:.1f}: acc={acc:.0%}  mean={mean_m:+.3f}  min={min_m:+.3f}")
 
     # Select best beta: highest min_margin among those with accuracy >= threshold
-    candidates = [b for b, r in results.items() if r["accuracy"] >= min_accuracy]
+    candidates = [b for b, r in results.items() if r["accuracy"]
+                  >= min_accuracy]
     if not candidates:
         candidates = list(results.keys())
     best_beta = max(candidates, key=lambda b: results[b]["min_margin"])
@@ -198,7 +202,8 @@ class SparseAutoencoder(nn.Module):
             nn.init.kaiming_uniform_(self.encoder.weight)
             self.decoder.weight.copy_(self.encoder.weight.T)
             self.decoder.weight.data /= (
-                self.decoder.weight.data.norm(dim=0, keepdim=True).clamp(min=1e-8)
+                self.decoder.weight.data.norm(
+                    dim=0, keepdim=True).clamp(min=1e-8)
             )
             nn.init.zeros_(self.encoder.bias)
             nn.init.zeros_(self.decoder.bias)
@@ -253,7 +258,8 @@ def train_sae(
     d_input = data.shape[1]
 
     if verbose:
-        print(f"  Training SAE: {d_input}d → {d_sae}d ({data.shape[0]:,} vectors, {epochs} epochs)")
+        print(
+            f"  Training SAE: {d_input}d → {d_sae}d ({data.shape[0]:,} vectors, {epochs} epochs)")
 
     # Exit inference_mode — ComfyUI wraps node execution in inference_mode()
     # which is stricter than no_grad and cannot be overridden by enable_grad().
@@ -264,7 +270,8 @@ def train_sae(
 
         sae = SparseAutoencoder(d_input, d_sae, l1_coeff).to(DEVICE)
         opt = torch.optim.Adam(sae.parameters(), lr=lr)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs, eta_min=lr * 0.1)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            opt, T_max=epochs, eta_min=lr * 0.1)
 
         loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(data),
@@ -274,7 +281,8 @@ def train_sae(
         )
         for epoch in range(1, epochs + 1):
             total_mse = total_l1 = 0
-            l1_scale = min(1.0, epoch / (epochs * 0.2))  # warmup over first 20%
+            l1_scale = min(1.0, epoch / (epochs * 0.2)
+                           )  # warmup over first 20%
 
             for (batch,) in loader:
                 batch = batch.to(DEVICE)
@@ -287,7 +295,8 @@ def train_sae(
 
                 # Enforce unit-norm decoder columns
                 with torch.no_grad():
-                    norms = sae.decoder.weight.data.norm(dim=0, keepdim=True).clamp(min=1e-8)
+                    norms = sae.decoder.weight.data.norm(
+                        dim=0, keepdim=True).clamp(min=1e-8)
                     sae.decoder.weight.data /= norms
 
                 total_mse += mse.item()
@@ -398,7 +407,8 @@ def collect_layer_activations(
     handle = model.layers[layer_idx].register_forward_hook(_hook)
 
     if verbose:
-        print(f"  Collecting activations from layer {layer_idx} ({len(texts)} texts)...")
+        print(
+            f"  Collecting activations from layer {layer_idx} ({len(texts)} texts)...")
 
     for i, text in enumerate(texts):
         inputs = tokenizer(
@@ -422,7 +432,8 @@ def collect_layer_activations(
         raise ValueError(f"Unknown pool mode: {pool}")
 
     if verbose:
-        print(f"  Collected: {result.shape} (norm={result.norm(dim=-1).mean():.2f})")
+        print(
+            f"  Collected: {result.shape} (norm={result.norm(dim=-1).mean():.2f})")
     return result
 
 
@@ -498,10 +509,12 @@ def extract_concept_features(
 
     # 5. Decode sparse (bias-free)
     with torch.no_grad():
-        sae_dir = sae_model.decode_sparse(sparse.unsqueeze(0).to(_dev)).cpu()[0]
+        sae_dir = sae_model.decode_sparse(
+            sparse.unsqueeze(0).to(_dev)).cpu()[0]
 
     # 6. Scale to match raw magnitude
-    sae_dir_scaled = sae_dir * (raw_dir.norm() / sae_dir.norm().clamp(min=1e-8))
+    sae_dir_scaled = sae_dir * \
+        (raw_dir.norm() / sae_dir.norm().clamp(min=1e-8))
     unit_dir = sae_dir / sae_dir.norm().clamp(min=1e-8)
 
     cos_sim = (F.normalize(raw_dir, dim=0) @ unit_dir).item()
@@ -514,7 +527,8 @@ def extract_concept_features(
         # Show top 5 features
         sorted_idx = torch.argsort(-diff[top_idx].abs())[:5]
         print(f"    Top-5 features: {[int(top_idx[i]) for i in sorted_idx]}")
-        print(f"    Top-5 weights:  {[f'{diff[top_idx[i]]:.3f}' for i in sorted_idx]}")
+        print(
+            f"    Top-5 weights:  {[f'{diff[top_idx[i]]:.3f}' for i in sorted_idx]}")
 
     return {
         "direction": unit_dir,
@@ -570,18 +584,17 @@ def load_qwen_encoder(encoder_path: str = ""):
     from safetensors import safe_open
 
     # Re-read env var at call time so nodes that set it after import work
-    path = encoder_path or os.environ.get("QWEN_ENCODER_PATH", "") or QWEN_ENCODER_PATH
+    path = encoder_path or os.environ.get(
+        "QWEN_ENCODER_PATH", "") or QWEN_ENCODER_PATH
 
     # Auto-discover from common locations if not explicitly set
     if not path or not os.path.isfile(path):
         _search_paths = [
-            # Common local paths
-            "/run/media/user/Turbo/Models/text_encoders/qwen_3_4b.safetensors",
-            # Relative to ComfyUI models dir
+            # Relative to ComfyUI install (custom_nodes/../models/)
             *[
                 str(p)
                 for comfy_root in [
-                    Path(__file__).resolve().parent.parent.parent,  # custom_nodes/../
+                    Path(__file__).resolve().parent.parent.parent,
                     Path(os.environ.get("COMFYUI_PATH", "")),
                 ]
                 if comfy_root and comfy_root.is_dir()
@@ -590,9 +603,10 @@ def load_qwen_encoder(encoder_path: str = ""):
                     comfy_root / "models" / "clip" / "qwen_3_4b.safetensors",
                 ]
             ],
-            # Home directory
+            # User home directories
             str(Path.home() / "Models" / "text_encoders" / "qwen_3_4b.safetensors"),
-            str(Path.home() / ".cache" / "comfyui" / "models" / "text_encoders" / "qwen_3_4b.safetensors"),
+            str(Path.home() / ".cache" / "comfyui" / "models" /
+                "text_encoders" / "qwen_3_4b.safetensors"),
         ]
         for candidate in _search_paths:
             if candidate and os.path.isfile(candidate):
@@ -627,7 +641,8 @@ def load_qwen_encoder(encoder_path: str = ""):
     sf = safe_open(path, framework="pt")
     state = {}
     for key in sf.keys():
-        new_key = key.replace("model.", "") if key.startswith("model.") else key
+        new_key = key.replace(
+            "model.", "") if key.startswith("model.") else key
         state[new_key] = sf.get_tensor(key)
 
     missing, unexpected = _qwen_encoder.load_state_dict(state, strict=False)
@@ -655,7 +670,7 @@ def encode_texts_qwen(texts: list[str], batch_size: int = 8, max_length: int = 2
     all_embeds = []
     with torch.no_grad():
         for i in range(0, len(texts), batch_size):
-            batch = texts[i : i + batch_size]
+            batch = texts[i: i + batch_size]
             inputs = tokenizer(
                 batch, return_tensors="pt", padding=True,
                 truncation=True, max_length=max_length,
@@ -674,7 +689,7 @@ def encode_texts_siglip(texts: list[str], batch_size: int = 16) -> torch.Tensor:
     all_embeds = []
     with torch.no_grad():
         for i in range(0, len(texts), batch_size):
-            batch = [t[:300] for t in texts[i : i + batch_size]]
+            batch = [t[:300] for t in texts[i: i + batch_size]]
             inp = processor(
                 text=batch, return_tensors="pt",
                 padding=True, truncation=True, max_length=64,
@@ -704,7 +719,7 @@ def encode_images_siglip(image_paths: list[str], batch_size: int = 8) -> torch.T
 
     with torch.no_grad():
         for i in range(0, len(image_paths), batch_size):
-            batch_paths = image_paths[i : i + batch_size]
+            batch_paths = image_paths[i: i + batch_size]
             images = []
             for p in batch_paths:
                 try:
@@ -775,7 +790,8 @@ def train_siglip_bridge(
     Uses InfoNCE loss to align SigLIP and Qwen embeddings for the same texts.
     """
     if verbose:
-        print(f"  Training SigLIP->Qwen bridge ({sig_embeds.shape[0]} pairs, {epochs} epochs)...")
+        print(
+            f"  Training SigLIP->Qwen bridge ({sig_embeds.shape[0]} pairs, {epochs} epochs)...")
 
     # Exit inference_mode — ComfyUI wraps node execution in inference_mode()
     # which is stricter than no_grad and cannot be overridden by enable_grad().
@@ -783,11 +799,15 @@ def train_siglip_bridge(
     # cloning an inference tensor outside still produces an inference tensor.
     with torch.inference_mode(False):
         sig_train = sig_embeds.detach().clone().to(DEVICE)
-        qwen_target = F.normalize(qwen_embeds.detach().clone().to(DEVICE), dim=-1)
+        qwen_target = F.normalize(
+            qwen_embeds.detach().clone().to(DEVICE), dim=-1)
 
-        proj = ProjectionHead(SIGLIP_DIM, QWEN_HIDDEN_DIM, hidden_dim=1024).to(DEVICE)
-        optimizer = torch.optim.AdamW(proj.parameters(), lr=lr, weight_decay=1e-4)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        proj = ProjectionHead(SIGLIP_DIM, QWEN_HIDDEN_DIM,
+                              hidden_dim=1024).to(DEVICE)
+        optimizer = torch.optim.AdamW(
+            proj.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs)
 
         for epoch in range(epochs):
             z_sig = proj(sig_train)
@@ -807,7 +827,8 @@ def train_siglip_bridge(
         with torch.no_grad():
             z_projected = proj(sig_train).cpu()
             sims = z_projected @ F.normalize(qwen_embeds, dim=-1).T
-            top1 = (sims.argmax(dim=1) == torch.arange(len(sims))).float().mean().item()
+            top1 = (sims.argmax(dim=1) == torch.arange(
+                len(sims))).float().mean().item()
             print(f"  Bridge trained — top-1 retrieval: {top1:.0%}")
 
     return proj
@@ -857,7 +878,8 @@ def generate_lens_from_text_pairs(
         h_neg = encode_texts_qwen(negative_texts)
 
         print("[3/4] Training DPO direction (2560d)...")
-        dpo = train_dpo_direction(h_pos, h_neg, dim=QWEN_HIDDEN_DIM, steps=dpo_steps)
+        dpo = train_dpo_direction(
+            h_pos, h_neg, dim=QWEN_HIDDEN_DIM, steps=dpo_steps)
 
         bridge_data = {}
         if include_bridge:
@@ -921,7 +943,8 @@ def generate_lens_from_text_pairs(
         h_neg = encode_texts_siglip(negative_texts)
 
         print("[3/3] Training DPO direction (768d)...")
-        dpo = train_dpo_direction(h_pos, h_neg, dim=SIGLIP_DIM, steps=dpo_steps)
+        dpo = train_dpo_direction(
+            h_pos, h_neg, dim=SIGLIP_DIM, steps=dpo_steps)
 
         lens_data = {
             "direction": dpo["direction"],
@@ -994,13 +1017,16 @@ def generate_lens_from_images(
     t0 = time.time()
 
     pos_images = collect_images(positive_dir)
-    print(f"[1/3] Found {len(pos_images)} positive images — encoding with SigLIP...")
+    print(
+        f"[1/3] Found {len(pos_images)} positive images — encoding with SigLIP...")
     if len(pos_images) < 2:
-        raise ValueError(f"Need at least 2 positive images, found {len(pos_images)}")
+        raise ValueError(
+            f"Need at least 2 positive images, found {len(pos_images)}")
     h_pos = encode_images_siglip(pos_images)
     mean_pos = F.normalize(h_pos.mean(dim=0), dim=0)
     print(f"  Positive centroid norm: {h_pos.mean(0).norm():.3f}")
-    print(f"  Intra-positive cosine: {F.cosine_similarity(h_pos, mean_pos.unsqueeze(0)).mean():.3f}")
+    print(
+        f"  Intra-positive cosine: {F.cosine_similarity(h_pos, mean_pos.unsqueeze(0)).mean():.3f}")
 
     if negative_dir:
         neg_images = collect_images(negative_dir)
@@ -1008,7 +1034,8 @@ def generate_lens_from_images(
         h_neg = encode_images_siglip(neg_images)
         mean_neg = F.normalize(h_neg.mean(dim=0), dim=0)
     elif n_negative_random > 0:
-        print(f"[2/3] Generating {n_negative_random} random negative vectors...")
+        print(
+            f"[2/3] Generating {n_negative_random} random negative vectors...")
         h_neg = torch.randn(n_negative_random, SIGLIP_DIM)
         h_neg = F.normalize(h_neg, dim=-1)
         mean_neg = F.normalize(h_neg.mean(dim=0), dim=0)
@@ -1054,16 +1081,20 @@ def generate_lens_from_images(
         if zimage_dir.is_dir():
             for lens_file in sorted(zimage_dir.glob("*.pt")):
                 try:
-                    existing = torch.load(lens_file, map_location="cpu", weights_only=False)
+                    existing = torch.load(
+                        lens_file, map_location="cpu", weights_only=False)
                     if "proj_sig2qwen_state" in existing:
                         print(f"  Loading bridge from {lens_file.name}...")
-                        proj = ProjectionHead(SIGLIP_DIM, QWEN_HIDDEN_DIM, hidden_dim=1024)
+                        proj = ProjectionHead(
+                            SIGLIP_DIM, QWEN_HIDDEN_DIM, hidden_dim=1024)
                         proj.load_state_dict(existing["proj_sig2qwen_state"])
                         proj = proj.to(DEVICE).eval()
                         with torch.no_grad():
-                            direction_qwen = proj(direction.unsqueeze(0).to(DEVICE)).squeeze(0).cpu()
+                            direction_qwen = proj(direction.unsqueeze(
+                                0).to(DEVICE)).squeeze(0).cpu()
                         direction_qwen = F.normalize(direction_qwen, dim=0)
-                        print(f"  Projected direction to {QWEN_HIDDEN_DIM}d via bridge")
+                        print(
+                            f"  Projected direction to {QWEN_HIDDEN_DIM}d via bridge")
                         bridge_found = True
                         break
                 except Exception:
@@ -1121,7 +1152,8 @@ def generate_lens_from_images(
 #  SAE Lens Generator
 # ═════════════════════════════════════════════════════════════════════════════
 
-_sae_cache: dict[str, SparseAutoencoder] = {}  # keyed by f"{layer}_{expansion}"
+# keyed by f"{layer}_{expansion}"
+_sae_cache: dict[str, SparseAutoencoder] = {}
 
 
 def generate_lens_sae(
@@ -1199,7 +1231,8 @@ def generate_lens_sae(
     d_sae = hidden_dim * sae_expansion
 
     print(f"  Target layer: {target_layer}/{num_layers}")
-    print(f"  SAE dimensions: {hidden_dim}d → {d_sae}d ({sae_expansion}x expansion)")
+    print(
+        f"  SAE dimensions: {hidden_dim}d → {d_sae}d ({sae_expansion}x expansion)")
 
     # ── Step 2: Load or train SAE ────────────────────────────────────────
     cache_key = f"{target_layer}_{sae_expansion}"
@@ -1207,12 +1240,14 @@ def generate_lens_sae(
     if sae_load_path and Path(sae_load_path).exists():
         print(f"\n[2/7] Loading pre-trained SAE from {sae_load_path}...")
         sae_model = SparseAutoencoder(hidden_dim, d_sae).to(DEVICE)
-        sae_state = torch.load(sae_load_path, map_location=DEVICE, weights_only=True)
+        sae_state = torch.load(
+            sae_load_path, map_location=DEVICE, weights_only=True)
         sae_model.load_state_dict(sae_state)
         sae_model.eval()
         print(f"  SAE loaded ({hidden_dim}d → {d_sae}d)")
     elif cache_key in _sae_cache:
-        print(f"\n[2/7] Using cached SAE (layer {target_layer}, {sae_expansion}x)...")
+        print(
+            f"\n[2/7] Using cached SAE (layer {target_layer}, {sae_expansion}x)...")
         sae_model = _sae_cache[cache_key]
     else:
         print(f"\n[2/7] Collecting activations for SAE training...")
@@ -1272,7 +1307,8 @@ def generate_lens_sae(
         h_neg = encode_texts_qwen(negative_texts)
 
         print(f"[{step+2}/7] Training DPO direction on output embeddings...")
-        dpo = train_dpo_direction(h_pos, h_neg, dim=QWEN_HIDDEN_DIM, steps=dpo_steps)
+        dpo = train_dpo_direction(
+            h_pos, h_neg, dim=QWEN_HIDDEN_DIM, steps=dpo_steps)
 
         dpo_direction = dpo["direction"]
 
@@ -1311,7 +1347,8 @@ def generate_lens_sae(
     # ── Step 5: Optional cross-modal bridge ──────────────────────────────
     bridge_data = {}
     if include_bridge:
-        print(f"\n[{step+3 if refine_dpo else step+1}/7] Training SigLIP -> Qwen bridge...")
+        print(
+            f"\n[{step+3 if refine_dpo else step+1}/7] Training SigLIP -> Qwen bridge...")
         all_texts = []
         for p, n in zip(positive_texts, negative_texts):
             all_texts.append(p)
@@ -1457,6 +1494,7 @@ def generate_lens_sae_from_preset(
         sae_save_path=sae_save_path,
         sae_load_path=sae_load_path,
     )
+
 
 CONCEPT_PRESETS = {
     "cinematic": {
@@ -1743,15 +1781,22 @@ Environment variables:
     sub = parser.add_subparsers(dest="command", required=True)
 
     # ── auto (from preset, DPO only) ──
-    p_auto = sub.add_parser("auto", help="Generate lens from built-in concept preset (DPO)")
-    p_auto.add_argument("concept", help="Preset name (e.g. cinematic, ethereal, dark_moody)")
-    p_auto.add_argument("--target", default="zimage", choices=["zimage", "sd15"])
-    p_auto.add_argument("--steps", type=int, default=5000, help="DPO training steps")
-    p_auto.add_argument("--output-dir", type=Path, default=None, help="Override output directory")
+    p_auto = sub.add_parser(
+        "auto", help="Generate lens from built-in concept preset (DPO)")
+    p_auto.add_argument(
+        "concept", help="Preset name (e.g. cinematic, ethereal, dark_moody)")
+    p_auto.add_argument("--target", default="zimage",
+                        choices=["zimage", "sd15"])
+    p_auto.add_argument("--steps", type=int, default=5000,
+                        help="DPO training steps")
+    p_auto.add_argument("--output-dir", type=Path,
+                        default=None, help="Override output directory")
 
     # ── sae (from preset, SAE + optional DPO) ──
-    p_sae = sub.add_parser("sae", help="Generate lens via SAE feature decomposition (interpretable)")
-    p_sae.add_argument("concept", help="Preset name (e.g. cinematic, ethereal, dark_moody)")
+    p_sae = sub.add_parser(
+        "sae", help="Generate lens via SAE feature decomposition (interpretable)")
+    p_sae.add_argument(
+        "concept", help="Preset name (e.g. cinematic, ethereal, dark_moody)")
     p_sae.add_argument("--target", default="zimage", choices=["zimage"])
     p_sae.add_argument("--layer", type=int, default=None,
                        help="Target layer to hook (default: 60%% depth = layer 22)")
@@ -1774,17 +1819,24 @@ Environment variables:
     p_sae.add_argument("--output-dir", type=Path, default=None)
 
     # ── text-pairs ──
-    p_text = sub.add_parser("text-pairs", help="Generate lens from custom text pairs JSON")
-    p_text.add_argument("pairs_file", help="JSON file with positive/negative text pairs")
-    p_text.add_argument("--concept", required=True, help="Concept name for the lens")
-    p_text.add_argument("--target", default="zimage", choices=["zimage", "sd15"])
+    p_text = sub.add_parser(
+        "text-pairs", help="Generate lens from custom text pairs JSON")
+    p_text.add_argument(
+        "pairs_file", help="JSON file with positive/negative text pairs")
+    p_text.add_argument("--concept", required=True,
+                        help="Concept name for the lens")
+    p_text.add_argument("--target", default="zimage",
+                        choices=["zimage", "sd15"])
     p_text.add_argument("--steps", type=int, default=5000)
     p_text.add_argument("--output-dir", type=Path, default=None)
 
     # ── few-shot ──
-    p_img = sub.add_parser("few-shot", help="Generate lens from example images")
-    p_img.add_argument("positive_dir", help="Directory of positive example images")
-    p_img.add_argument("--negative", dest="negative_dir", help="Directory of negative images")
+    p_img = sub.add_parser(
+        "few-shot", help="Generate lens from example images")
+    p_img.add_argument(
+        "positive_dir", help="Directory of positive example images")
+    p_img.add_argument("--negative", dest="negative_dir",
+                       help="Directory of negative images")
     p_img.add_argument("--concept", required=True, help="Concept name")
     p_img.add_argument("--target", default="sd15", choices=["zimage", "sd15"])
     p_img.add_argument("--output-dir", type=Path, default=None)
@@ -1796,8 +1848,10 @@ Environment variables:
     sub.add_parser("list-lenses", help="List installed lenses")
 
     # ── batch-all ──
-    p_batch = sub.add_parser("batch-all", help="Generate lenses for ALL presets")
-    p_batch.add_argument("--target", default="zimage", choices=["zimage", "sd15"])
+    p_batch = sub.add_parser(
+        "batch-all", help="Generate lenses for ALL presets")
+    p_batch.add_argument("--target", default="zimage",
+                         choices=["zimage", "sd15"])
     p_batch.add_argument("--method", default="dpo", choices=["dpo", "sae"],
                          help="Training method: 'dpo' (fast) or 'sae' (interpretable, default: dpo)")
     p_batch.add_argument("--steps", type=int, default=5000)
