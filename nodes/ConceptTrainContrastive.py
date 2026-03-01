@@ -1,12 +1,17 @@
 """
-ConceptTrainDPO — Train a DPO concept lens from text pairs within ComfyUI.
+ConceptTrainContrastive — Train a contrastive concept lens from text pairs.
 
-Takes positive and negative text descriptions (one per line), trains a DPO
-direction vector that separates the concept from its absence, and saves
-the resulting lens as a .pt file that can be loaded by Concept Steer.
+Takes positive and negative text descriptions (one per line), trains a
+contrastive direction vector that separates the concept from its absence,
+and saves the resulting lens as a .pt file that can be loaded by Concept Steer.
+
+The training uses a paired Bradley-Terry margin loss with beta sweep:
+  L = -mean(log(σ(β × margins)))
+This finds the unit vector that maximally separates positive from negative
+embeddings with robust worst-case margins.
 
 Usage in ComfyUI:
-  [Concept Train DPO] → lens_path → [Concept Steer (custom_lens_path)]
+  [Train Lens (Contrastive)] → lens_path → [Concept Steer (custom_lens_path)]
 """
 
 import os
@@ -42,16 +47,16 @@ def _get_output_dir(target: str) -> Path:
     return out
 
 
-class ConceptTrainDPONode(io.ComfyNode):
-    """Train a DPO concept lens from positive/negative text descriptions."""
+class ConceptTrainContrastiveNode(io.ComfyNode):
+    """Train a contrastive concept lens from positive/negative text descriptions."""
 
     @classmethod
     def define_schema(cls) -> io.Schema:
         return io.Schema(
-            node_id="conceptsteer.TrainDPO",
-            display_name="Train Lens (DPO)",
+            node_id="conceptsteer.TrainContrastive",
+            display_name="Train Lens (Contrastive)",
             description=(
-                "Train a concept direction via Direct Preference Optimization. "
+                "Train a concept direction via contrastive paired-margin optimization. "
                 "Provide positive texts embodying the concept and negative texts "
                 "describing similar scenes WITHOUT the concept. Fast (~30s)."
             ),
@@ -91,12 +96,12 @@ class ConceptTrainDPONode(io.ComfyNode):
                     ),
                 ),
                 io.Int.Input(
-                    "dpo_steps",
+                    "contrastive_steps",
                     default=500,
                     min=500,
                     max=20000,
                     step=500,
-                    tooltip="DPO optimization steps (more = more refined)",
+                    tooltip="Contrastive optimization steps (more = more refined)",
                 ),
                 io.String.Input(
                     "encoder_path",
@@ -124,7 +129,7 @@ class ConceptTrainDPONode(io.ComfyNode):
         positive_texts: str = "",
         negative_texts: str = "",
         target: str = "zimage",
-        dpo_steps: int = 5000,
+        contrastive_steps: int = 500,
         encoder_path: str = "",
         output_dir: str = "",
     ):
@@ -147,8 +152,8 @@ class ConceptTrainDPONode(io.ComfyNode):
             )
             return io.NodeOutput("")
 
-        _log(f"Training DPO lens: '{concept_name}' ({target})")
-        _log(f"  {len(pos_lines)} text pairs, {dpo_steps} steps")
+        _log(f"Training contrastive lens: '{concept_name}' ({target})")
+        _log(f"  {len(pos_lines)} text pairs, {contrastive_steps} steps")
 
         # ── Set encoder path if provided ──
         if encoder_path.strip():
@@ -176,14 +181,14 @@ class ConceptTrainDPONode(io.ComfyNode):
                 target=target,
                 include_bridge=(target == "zimage"),
                 output_dir=out,
-                dpo_steps=dpo_steps,
+                contrastive_steps=contrastive_steps,
             )
             elapsed = time.time() - t0
-            _log(f"DPO lens trained in {elapsed:.1f}s → {lens_path}")
+            _log(f"Contrastive lens trained in {elapsed:.1f}s → {lens_path}")
             return io.NodeOutput(str(lens_path))
 
         except Exception as e:
-            _log(f"ERROR during DPO training: {e}")
+            _log(f"ERROR during contrastive training: {e}")
             import traceback
             traceback.print_exc()
             return io.NodeOutput("")

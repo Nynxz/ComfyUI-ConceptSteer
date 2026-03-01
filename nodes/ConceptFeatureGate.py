@@ -52,19 +52,21 @@ _sae_cache: dict[str, object] = {}
 
 
 def _load_sae(sae_path: str, d_model: int, expansion: int):
-    """Load SAE from path, caching by path string."""
+    """Load SAE or transcoder from path, auto-detecting format.
+
+    Uses the universal loader from lens_factory which handles both native
+    SparseAutoencoder state dicts (.pt) and pretrained transcoder safetensors
+    (W_enc/W_dec format). Expansion is auto-detected from weight shapes.
+    """
     cache_key = sae_path
     if cache_key in _sae_cache:
         return _sae_cache[cache_key]
 
-    from lens_factory import SparseAutoencoder, DEVICE
+    from lens_factory import load_sae_or_transcoder
 
-    d_sae = d_model * expansion
-    _log(f"Loading SAE: {os.path.basename(sae_path)} ({d_model}d → {d_sae}d)")
-    sae = SparseAutoencoder(d_model, d_sae).to(DEVICE)
-    state = torch.load(sae_path, map_location=DEVICE, weights_only=True)
-    sae.load_state_dict(state)
-    sae.eval()
+    _log(f"Loading SAE/transcoder: {os.path.basename(sae_path)}")
+    sae = load_sae_or_transcoder(
+        sae_path, d_model=d_model, expected_expansion=expansion)
     _sae_cache[cache_key] = sae
     return sae
 
@@ -175,8 +177,21 @@ class ConceptFeatureGateNode(io.ComfyNode):
                     "sae_expansion",
                     default=8,
                     min=2,
-                    max=16,
-                    tooltip="SAE expansion factor (must match Feature Map)",
+                    max=128,
+                    tooltip=(
+                        "SAE expansion factor (auto-detected for transcoders). "
+                        "8x for trained SAEs, 64x for pretrained transcoders."
+                    ),
+                ),
+                io.String.Input(
+                    "transcoder_repo",
+                    default="",
+                    tooltip=(
+                        "HuggingFace repo for pretrained transcoders "
+                        "(e.g. 'mwhanna/qwen3-4b-transcoders'). "
+                        "Auto-downloads on first use. "
+                        "Leave empty to use sae_path instead."
+                    ),
                 ),
                 io.Boolean.Input(
                     "per_token",
@@ -202,10 +217,12 @@ class ConceptFeatureGateNode(io.ComfyNode):
         amplify_features: str = "",
         gate_strength: float = 1.0,
         sae_expansion: int = 8,
+        transcoder_repo: str = "",
         per_token: bool = True,
     ):
         # ── Early exits ──
         sae_path = sae_path.strip()
+        transcoder_repo = transcoder_repo.strip()
         suppress_spec = _parse_feature_spec(suppress_features)
         amplify_spec = _parse_feature_spec(amplify_features)
 
@@ -213,14 +230,26 @@ class ConceptFeatureGateNode(io.ComfyNode):
         for idx, scale in amplify_spec.items():
             all_mods[idx] = scale
 
-        if not sae_path or not all_mods or abs(gate_strength) < 1e-6:
-            if not sae_path:
-                _log("No SAE path — passing conditioning through")
+        if (not sae_path and not transcoder_repo) or not all_mods or abs(gate_strength) < 1e-6:
+            if not sae_path and not transcoder_repo:
+                _log("No SAE/transcoder path — passing conditioning through")
             elif not all_mods:
                 _log("No features specified — passing conditioning through")
             else:
                 _log("Gate strength ≈ 0 — passing conditioning through")
             return io.NodeOutput(conditioning)
+
+        # ── Resolve SAE / transcoder path ──
+        if transcoder_repo and not sae_path:
+            try:
+                from lens_factory import download_transcoder_layer
+                tc_path = download_transcoder_layer(
+                    layer=22, repo_id=transcoder_repo)
+                sae_path = str(tc_path)
+                _log(f"Using transcoder from {transcoder_repo}")
+            except Exception as e:
+                _log(f"Failed to download transcoder: {e}")
+                return io.NodeOutput(conditioning)
 
         if not os.path.isabs(sae_path):
             sae_path = str(_PACKAGE_ROOT / sae_path)
@@ -229,11 +258,13 @@ class ConceptFeatureGateNode(io.ComfyNode):
             _log(f"SAE not found: {sae_path} — passing through")
             return io.NodeOutput(conditioning)
 
-        # ── Load SAE ──
+        # ── Load SAE / transcoder ──
         cond_dim = conditioning[0][0].shape[-1]
         sae = _load_sae(sae_path, cond_dim, sae_expansion)
         sae_device = next(sae.parameters()).device
-        d_sae = cond_dim * sae_expansion
+
+        # Auto-detect actual d_sae from loaded model weights
+        d_sae = sae.encoder.weight.shape[0]
 
         # Validate feature indices
         valid_mods = {

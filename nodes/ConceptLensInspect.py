@@ -253,15 +253,19 @@ def _build_summary(data: dict, lens_name: str, lens_path: str) -> str:
         if "direction_dim" in data:
             lines.append(f"Direction Dim: {data['direction_dim']}")
 
-        # DPO stats
-        if "dpo_accuracy" in data:
-            lines.append(f"DPO Accuracy: {data['dpo_accuracy']:.1%}")
-        if "dpo_beta" in data:
-            lines.append(f"DPO Beta: {data['dpo_beta']}")
-        if "dpo_mean_margin" in data:
-            lines.append(f"DPO Mean Margin: {data['dpo_mean_margin']:+.4f}")
-        if "dpo_min_margin" in data:
-            lines.append(f"DPO Min Margin: {data['dpo_min_margin']:+.4f}")
+        # Contrastive stats (support both old 'dpo_*' and new 'contrastive_*' keys)
+        acc_key = "contrastive_accuracy" if "contrastive_accuracy" in data else "dpo_accuracy"
+        beta_key = "contrastive_beta" if "contrastive_beta" in data else "dpo_beta"
+        mean_key = "contrastive_mean_margin" if "contrastive_mean_margin" in data else "dpo_mean_margin"
+        min_key = "contrastive_min_margin" if "contrastive_min_margin" in data else "dpo_min_margin"
+        if acc_key in data:
+            lines.append(f"Contrastive Accuracy: {data[acc_key]:.1%}")
+        if beta_key in data:
+            lines.append(f"Contrastive Beta: {data[beta_key]}")
+        if mean_key in data:
+            lines.append(f"Contrastive Mean Margin: {data[mean_key]:+.4f}")
+        if min_key in data:
+            lines.append(f"Contrastive Min Margin: {data[min_key]:+.4f}")
 
         # SAE stats
         if "sae_feature_indices" in data:
@@ -275,7 +279,7 @@ def _build_summary(data: dict, lens_name: str, lens_path: str) -> str:
             lines.append(f"SAE Expansion: {data['sae_expansion']}x")
         if "sae_direction_weight" in data:
             lines.append(
-                f"SAE/DPO Blend: {data['sae_direction_weight']:.0%} SAE")
+                f"SAE/Contrastive Blend: {data['sae_direction_weight']:.0%} SAE")
 
         # Cross-modal
         if "siglip_dim" in data:

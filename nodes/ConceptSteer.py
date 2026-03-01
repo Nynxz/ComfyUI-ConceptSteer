@@ -1,15 +1,15 @@
 """
 ConceptSteer — Apply concept directions to conditioning for steered image generation.
 
-Loads a concept lens (.pt file containing a direction vector trained via DPO/SAE)
-and adds it to the CLIP/text-encoder conditioning tensor, steering image generation
-towards (or away from) a learned concept.
+Loads a concept lens (.pt file containing a direction vector trained via
+contrastive optimization or SAE decomposition) and adds it to the CLIP/text-encoder
+conditioning tensor, steering image generation towards (or away from) a learned concept.
 
 The node operates on ComfyUI's CONDITIONING type, which is a list of
 (cond_tensor, pooled_dict) tuples.  cond_tensor is [B, tokens, dim].
 
 Supported lens formats:
-  1. DPO concept lens (.pt) — contains 'direction' key (2560d for Qwen, 768d for CLIP)
+  1. Contrastive concept lens (.pt) — contains 'direction' key (2560d for Qwen, 768d for CLIP)
   2. Cross-modal lens (.pt) — contains 'd_in_siglip' (768d SigLIP direction)
   3. SAE concept lens (.safetensors/.pt) — contains 'direction' key
   4. Raw direction tensor (.pt) — a single tensor
@@ -62,8 +62,8 @@ _LENS_ROOT = _find_lens_root()
 def _discover_lenses() -> list[str]:
     """Find all .pt and .safetensors lens files recursively.
 
-    Returns relative paths like 'cinematic_zimage_dpo.pt' or
-    'zimage/cinematic_zimage_dpo.pt' so users see which subdirectory a lens
+    Returns relative paths like 'cinematic_zimage_contrastive.pt' or
+    'zimage/cinematic_zimage_contrastive.pt' so users see which subdirectory a lens
     belongs to.
     """
     lenses = []
@@ -101,7 +101,7 @@ def _extract_direction(data) -> torch.Tensor:
     """Extract a 1-D direction vector from various lens formats.
 
     Supported keys (checked in order):
-      - 'direction'    → DPO/SAE concept lens (primary format)
+      - 'direction'    → contrastive/SAE concept lens (primary format)
       - 'd_in_siglip'  → cross-modal lens, SigLIP 768d direction
       - 'd_shared'     → shared-space direction
       - raw tensor     → use directly
@@ -115,7 +115,7 @@ def _extract_direction(data) -> torch.Tensor:
             f"Cannot interpret tensor shape {data.shape} as direction")
 
     if isinstance(data, dict):
-        # DPO/SAE concept lens — primary format
+        # Contrastive/SAE concept lens — primary format
         if "direction" in data:
             _log(f"Using 'direction' key ({data['direction'].shape[0]}d)")
             return data["direction"].float().squeeze()
@@ -182,7 +182,7 @@ class ConceptSteerNode(io.ComfyNode):
             node_id="conceptsteer.Steer",
             display_name="Concept Steer",
             description=(
-                "Apply a DPO/SAE-trained concept direction to conditioning. "
+                "Apply a contrastive/SAE-trained concept direction to conditioning. "
                 "Steers image generation towards (positive strength) or away from "
                 "(negative strength) a learned concept like 'cinematic', 'ethereal', etc."
             ),

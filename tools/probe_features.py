@@ -11,7 +11,7 @@ Usage:
   python tools/probe_features.py --sae-path ./sae_layer22_8x.pt
 
   # Probe specific features from a lens file
-  python tools/probe_features.py --lens-path ./lenses/zimage/cinematic_zimage_sae_dpo.pt
+  python tools/probe_features.py --lens-path ./lenses/zimage/cinematic_zimage_sae_contrastive.pt
 
   # Probe with more prompts for better coverage
   python tools/probe_features.py --sae-path ./sae.pt --n-prompts 1000 --top-k 10
@@ -611,7 +611,7 @@ def main():
         epilog="""
 Examples:
   # Probe features from a trained lens
-  python tools/probe_features.py --lens-path ./lenses/zimage/cinematic_zimage_sae_dpo.pt --sae-path ./sae.pt
+  python tools/probe_features.py --lens-path ./lenses/zimage/cinematic_zimage_sae_contrastive.pt --sae-path ./sae.pt
 
   # Probe all active features in an SAE
   python tools/probe_features.py --sae-path ./sae.pt --all-features

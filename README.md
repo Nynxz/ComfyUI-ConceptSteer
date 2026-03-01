@@ -73,7 +73,7 @@ It works because text-to-image conditioning is injected via cross-attention, and
 - **Broad concepts only** — works well for general aesthetics (cinematic, vintage, moody) but not for specific subjects, characters, or fine-grained styles. It's adding a single vector to every token, so it can't encode spatially-varying or compositionally-complex concepts.
 - **Prompt interference** — the direction is added regardless of prompt content. If your prompt already describes the concept, stacking a lens on top can overshoot or create artifacts.
 - **Training data sensitivity** — with only 10 text pairs, the direction can overfit to incidental correlations in the training texts rather than the intended concept. Carefully crafted contrastive pairs matter a lot.
-- **Not interpretable by default** — DPO lenses are opaque direction vectors. SAE lenses record which sparse features they use, but without a feature labeling pipeline those indices are just numbers.
+- **Not interpretable by default** — contrastive lenses are opaque direction vectors. SAE lenses record which sparse features they use, but without a feature labeling pipeline those indices are just numbers.
 - **Limited model support** — currently only tested with Z Image Turbo and SD 1.5. Other architectures may use non-linear conditioning injection where adding a direction doesn't transfer cleanly.
 
 ## Installation
@@ -92,12 +92,12 @@ git clone https://github.com/nynxz/comfyui-conceptsteer.git
 
 ## Quick Start
 
-No pre-trained lenses are shipped. Generate them locally (~30 seconds for DPO, ~5 minutes for SAE):
+No pre-trained lenses are shipped. Generate them locally (~30 seconds for Contrastive, ~5 minutes for SAE):
 
 ```bash
 cd ComfyUI/custom_nodes/comfyui-conceptsteer
 
-# Generate a single lens (DPO — fast)
+# Generate a single lens (Contrastive — fast)
 python tools/lens_factory.py auto cinematic --target zimage
 
 # Generate all 6 presets at once
@@ -148,12 +148,12 @@ Generated lenses are saved to `lenses/` and automatically appear in the Concept 
 | 5.0+ | Dominant (may distort) |
 | Negative | Steers away |
 
-## Node: Train Lens (DPO)
+## Node: Train Lens (Contrastive)
 
-Train a concept direction via Direct Preference Optimization from text descriptions.
+Train a concept direction via Paired Margin Optimization from text descriptions.
 
 ```
-[Train Lens (DPO)] → lens_path → [Concept Steer (custom_lens_path)]
+[Train Lens (Contrastive)] → lens_path → [Concept Steer (custom_lens_path)]
 ```
 
 | Input | Type | Default | Description |
@@ -162,7 +162,7 @@ Train a concept direction via Direct Preference Optimization from text descripti
 | positive_texts | String (multiline) | — | Texts embodying the concept (one per line) |
 | negative_texts | String (multiline) | — | Neutral texts without the concept (one per line) |
 | target | Combo | zimage | zimage (2560d) or sd15 (768d) |
-| dpo_steps | Int | 500 | Optimization steps |
+| contrastive_steps | Int | 500 | Optimization steps |
 | encoder_path | String | "" | Path to Qwen 3.4B safetensors |
 | output_dir | String | "" | Override output directory |
 
@@ -182,8 +182,8 @@ Train an interpretable concept lens via Sparse Autoencoder decomposition of the 
 | sae_epochs | Int | 200 | SAE training epochs |
 | sae_features | Int | 30 | Top-K features to keep |
 | n_prompts | Int | 500 | Diverse prompts for activation collection |
-| refine_dpo | Boolean | True | Blend with DPO direction |
-| dpo_steps | Int | 500 | DPO optimization steps |
+| refine_contrastive | Boolean | True | Blend with contrastive direction |
+| contrastive_steps | Int | 500 | contrastive optimization steps |
 | sae_save_path | String | "" | Save SAE for reuse |
 | sae_load_path | String | "" | Load pre-trained SAE |
 | encoder_path | String | "" | Path to Qwen 3.4B |
@@ -260,14 +260,14 @@ Cosine similarity and weight overlap between two lenses. Helps determine whether
 Use the included `lens_factory.py` CLI to create lenses:
 
 ```bash
-# DPO only (fast, ~30s per lens)
+# Contrastive only (fast, ~30s per lens)
 python tools/lens_factory.py auto cinematic --target zimage
 
-# SAE + DPO (slower, records which sparse features define the concept)
+# SAE + Contrastive (slower, records which sparse features define the concept)
 python tools/lens_factory.py sae cinematic --target zimage
 
-# SAE without DPO refinement
-python tools/lens_factory.py sae cinematic --no-refine-dpo
+# SAE without contrastive refinement
+python tools/lens_factory.py sae cinematic --no-refine-contrastive
 
 # From custom text pairs
 python tools/lens_factory.py text-pairs pairs.json --concept mystyle --target zimage
@@ -280,11 +280,11 @@ python tools/lens_factory.py sae cinematic --sae-save ./my_sae.pt
 python tools/lens_factory.py sae ethereal --sae-load ./my_sae.pt
 ```
 
-### DPO vs SAE
+### Contrastive vs SAE
 
 | Method | Speed | Notes |
 |--------|-------|-------|
-| `auto` (DPO) | ~30s/lens | Trains a separating hyperplane on output embeddings. Fast, opaque. |
+| `auto` (Contrastive) | ~30s/lens | Trains a separating hyperplane on output embeddings. Fast, opaque. |
 | `sae` | ~5min/lens | Hooks into residual stream, decomposes into sparse features, finds differential ones. Records feature indices in metadata. |
 | `sae --sae-load` | ~30s/lens | Reuses a cached SAE — only the feature extraction step runs. |
 
@@ -309,13 +309,13 @@ See [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for the full technical details.
 
 **Short version:**
 
-### DPO Mode
+### Contrastive Mode
 
 1. Encode positive/negative text pairs through the text encoder (Qwen 3.4B or SigLIP)
-2. Optimize a unit vector using a DPO-adapted loss to maximally separate positive from negative embeddings (sweep beta, pick best min-margin)
+2. Optimize a unit vector using a Contrastive-adapted loss to maximally separate positive from negative embeddings (sweep beta, pick best min-margin)
 3. At inference: add the direction to every active token position, scaled by `strength × average_token_norm`
 
-This is essentially training a linear classifier. With 10 well-crafted contrastive pairs, DPO typically achieves 100% separation.
+This is essentially training a linear classifier. With 10 well-crafted contrastive pairs, Contrastive typically achieves 100% separation.
 
 ### SAE Mode
 
@@ -324,7 +324,7 @@ This is essentially training a linear classifier. With 10 well-crafted contrasti
 3. Train a Sparse Autoencoder (8x expansion → 20,480 features) on those activations
 4. Run contrastive concept texts through the model + SAE, find features that fire differentially
 5. Reconstruct a direction from the top-K features via bias-free decoding
-6. Optionally blend with a DPO direction for better separation
+6. Optionally blend with a contrastive direction for better separation
 
 The SAE approach follows [Bricken et al. (2023)](https://transformer-circuits.pub/2023/monosemantic-features/index.html). The resulting direction is built from identifiable sparse features rather than an opaque optimization target.
 
@@ -337,7 +337,7 @@ This is an integration of existing research into a practical tool. The underlyin
 - **Linear Representation Hypothesis**: Nanda et al. (2023), Park et al. (2024)
 - **Steering Vectors / Activation Addition**: Turner et al. (2023)
 - **Concept Activation Vectors (TCAVs)**: Kim et al. (ICML 2018)
-- **DPO Loss**: Rafailov et al. (2023)
+- **Contrastive Loss**: Rafailov et al. (2023)
 - **Sparse Autoencoders**: Bricken et al. (Anthropic, 2023)
 - **Representation Engineering**: Zou et al. (2023)
 
@@ -348,7 +348,7 @@ Built by [nynxz](https://github.com/nynxz) with significant help from Claude (An
 - ComfyUI (latest)
 - PyTorch (comes with ComfyUI)
 - For lens creation: `transformers`, `safetensors` (`pip install transformers safetensors`)
-- For SAE/DPO training with Qwen: ~10 GB VRAM
+- For SAE/Contrastive training with Qwen: ~10 GB VRAM
 
 ## License
 

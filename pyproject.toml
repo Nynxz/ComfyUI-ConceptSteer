@@ -1,6 +1,6 @@
 [project]
 name = "comfyui-conceptsteer"
-description = "Concept Steering for ComfyUI — steer image generation with learned concept directions via SAE + DPO"
+description = "Concept Steering for ComfyUI — steer image generation with learned concept directions via SAE + contrastive optimization"
 version = "0.1.0"
 license = { text = "MIT" }
 readme = "README.md"
@@ -15,5 +15,5 @@ Documentation = "https://github.com/nynxz/comfyui-conceptsteer/blob/main/docs/HO
 PublisherId = "nynxz"
 DisplayName = "Concept Steer"
 Icon = ""
-Description = "Steer image generation toward learned concepts (cinematic, ethereal, etc.) using SAE/DPO direction vectors. No LoRA, no fine-tuning — just plug in a lens and adjust strength."
+Description = "Steer image generation toward learned concepts (cinematic, ethereal, etc.) using SAE/contrastive direction vectors. No LoRA, no fine-tuning — just plug in a lens and adjust strength."
 includes = ["js", "docs"]

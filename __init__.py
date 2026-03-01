@@ -1,16 +1,16 @@
 """
 Concept Steer — Concept Steering for ComfyUI
 
-Steer image generation toward learned concepts using DPO/SAE-trained direction
-vectors. No LoRA, no fine-tuning — just a single vector that nudges conditioning
-toward your desired aesthetic.
+Steer image generation toward learned concepts using contrastive/SAE-trained
+direction vectors. No LoRA, no fine-tuning — just a single vector that nudges
+conditioning toward your desired aesthetic.
 
 Nodes:
   Steering:
     - Concept Steer: Apply a concept lens to CLIP/text-encoder conditioning
 
   Training:
-    - Train Lens (DPO): Train a concept lens from text pairs via DPO
+    - Train Lens (Contrastive): Train a concept lens from text pairs via contrastive optimization
     - Train Lens (SAE): Train a concept lens via SAE feature decomposition
     - Train Lens (Few-Shot): Train a concept lens from example images
 
@@ -28,7 +28,7 @@ Nodes:
 
 from comfy_api.latest import ComfyExtension, io
 from .nodes.ConceptSteer import ConceptSteerNode
-from .nodes.ConceptTrainDPO import ConceptTrainDPONode
+from .nodes.ConceptTrainContrastive import ConceptTrainContrastiveNode
 from .nodes.ConceptTrainSAE import ConceptTrainSAENode
 from .nodes.ConceptTrainFewShot import ConceptTrainFewShotNode
 from .nodes.ConceptLensInspect import ConceptLensInspectNode
@@ -36,6 +36,7 @@ from .nodes.ConceptActivationProbe import ConceptActivationProbeNode
 from .nodes.ConceptLensCompare import ConceptLensCompareNode
 from .nodes.ConceptFeatureMap import ConceptFeatureMapNode
 from .nodes.ConceptFeatureGate import ConceptFeatureGateNode
+from .nodes.ConceptFeatureProbe import ConceptFeatureProbeNode
 from .nodes.ConceptTrainSAEOnly import ConceptTrainSAEOnlyNode
 from .nodes.ConceptFeatureDict import ConceptFeatureDictNode
 
@@ -46,7 +47,7 @@ class ConceptSteerExtension(ComfyExtension):
             # Steering
             ConceptSteerNode,
             # Training
-            ConceptTrainDPONode,
+            ConceptTrainContrastiveNode,
             ConceptTrainSAENode,
             ConceptTrainFewShotNode,
             # Interpretability
@@ -58,6 +59,7 @@ class ConceptSteerExtension(ComfyExtension):
             ConceptFeatureDictNode,
             ConceptFeatureMapNode,
             ConceptFeatureGateNode,
+            ConceptFeatureProbeNode,
         ]
 
 

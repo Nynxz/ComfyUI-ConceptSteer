@@ -45,19 +45,21 @@ _sae_cache: dict[str, object] = {}
 
 
 def _load_sae(sae_path: str, d_model: int, expansion: int):
-    """Load SAE from path, caching by path string."""
+    """Load SAE or transcoder from path, auto-detecting format.
+
+    Uses the universal loader from lens_factory which handles both native
+    SparseAutoencoder state dicts (.pt) and pretrained transcoder safetensors
+    (W_enc/W_dec format). Expansion is auto-detected from weight shapes.
+    """
     cache_key = sae_path
     if cache_key in _sae_cache:
         return _sae_cache[cache_key]
 
-    from lens_factory import SparseAutoencoder, DEVICE
+    from lens_factory import load_sae_or_transcoder
 
-    d_sae = d_model * expansion
-    _log(f"Loading SAE: {os.path.basename(sae_path)} ({d_model}d → {d_sae}d)")
-    sae = SparseAutoencoder(d_model, d_sae).to(DEVICE)
-    state = torch.load(sae_path, map_location=DEVICE, weights_only=True)
-    sae.load_state_dict(state)
-    sae.eval()
+    _log(f"Loading SAE/transcoder: {os.path.basename(sae_path)}")
+    sae = load_sae_or_transcoder(
+        sae_path, d_model=d_model, expected_expansion=expansion)
     _sae_cache[cache_key] = sae
     return sae
 
@@ -154,19 +156,27 @@ def _generate_feature_chart(
 # ── SAE file discovery ──────────────────────────────────────────────────────
 
 def _discover_sae_files() -> list[str]:
-    """Find SAE weight files in common locations."""
+    """Find SAE/transcoder weight files in common locations."""
     files = []
     search_dirs = [
         _PACKAGE_ROOT / "sae",
+        _PACKAGE_ROOT / "sae" / "transcoders",
         _PACKAGE_ROOT / "lenses",
         _PACKAGE_ROOT,
     ]
     for d in search_dirs:
         if not d.is_dir():
             continue
+        # Find .pt SAE files
         for f in d.rglob("*.pt"):
             name = f.name.lower()
             if "sae" in name and f.stat().st_size > 1_000_000:
+                rel = str(f.relative_to(_PACKAGE_ROOT))
+                if rel not in files:
+                    files.append(rel)
+        # Find .safetensors transcoder files
+        for f in d.rglob("*.safetensors"):
+            if f.stat().st_size > 1_000_000:
                 rel = str(f.relative_to(_PACKAGE_ROOT))
                 if rel not in files:
                     files.append(rel)
@@ -212,8 +222,21 @@ class ConceptFeatureMapNode(io.ComfyNode):
                     "sae_expansion",
                     default=8,
                     min=2,
-                    max=16,
-                    tooltip="SAE expansion factor (must match training)",
+                    max=128,
+                    tooltip=(
+                        "SAE expansion factor (auto-detected for transcoders). "
+                        "8x for trained SAEs, 64x for pretrained transcoders."
+                    ),
+                ),
+                io.String.Input(
+                    "transcoder_repo",
+                    default="",
+                    tooltip=(
+                        "HuggingFace repo for pretrained transcoders "
+                        "(e.g. 'mwhanna/qwen3-4b-transcoders'). "
+                        "Auto-downloads ~1.7GB layer file on first use. "
+                        "Leave empty to use sae_path instead."
+                    ),
                 ),
                 io.Combo.Input(
                     "pool_mode",
@@ -249,25 +272,43 @@ class ConceptFeatureMapNode(io.ComfyNode):
         top_k: int = 30,
         sae_expansion: int = 8,
         pool_mode: str = "mean",
+        transcoder_repo: str = "",
         dict_path: str = "",
     ):
-        # ── Validate SAE path ──
+        # ── Resolve SAE / transcoder path ──
         sae_path = sae_path.strip()
+        transcoder_repo = transcoder_repo.strip()
+
+        if transcoder_repo and not sae_path:
+            # Auto-download transcoder layer
+            try:
+                from lens_factory import download_transcoder_layer
+                tc_path = download_transcoder_layer(
+                    layer=22, repo_id=transcoder_repo)
+                sae_path = str(tc_path)
+                _log(f"Using transcoder from {transcoder_repo}")
+            except Exception as e:
+                _log(f"Failed to download transcoder: {e}")
+                return io.NodeOutput(
+                    torch.zeros(1, 64, 64, 3),
+                    f"Error downloading transcoder: {e}",
+                )
+
         if not sae_path:
-            _log("No SAE path provided — cannot decompose features")
+            _log("No SAE/transcoder path provided — cannot decompose features")
             return io.NodeOutput(
                 torch.zeros(1, 64, 64, 3),
-                "Error: SAE path required",
+                "Error: SAE path or transcoder_repo required",
             )
 
         if not os.path.isabs(sae_path):
             sae_path = str(_PACKAGE_ROOT / sae_path)
 
         if not os.path.isfile(sae_path):
-            _log(f"SAE file not found: {sae_path}")
+            _log(f"SAE/transcoder file not found: {sae_path}")
             return io.NodeOutput(
                 torch.zeros(1, 64, 64, 3),
-                f"Error: SAE file not found at {sae_path}",
+                f"Error: file not found at {sae_path}",
             )
 
         # ── Extract conditioning tensor ──
@@ -279,9 +320,15 @@ class ConceptFeatureMapNode(io.ComfyNode):
         _log(
             f"Conditioning: {cond_tensor.shape} (dim={cond_dim}, tokens={n_tokens})")
 
-        # ── Load SAE ──
+        # ── Load SAE / transcoder ──
         sae = _load_sae(sae_path, cond_dim, sae_expansion)
         sae_device = next(sae.parameters()).device
+
+        # Auto-detect actual expansion from loaded weights
+        actual_d_sae = sae.encoder.weight.shape[0]
+        actual_expansion = actual_d_sae // cond_dim
+        is_transcoder = sae_path.endswith(
+            ".safetensors") or actual_expansion > 16
 
         # ── Encode through SAE ──
         with torch.no_grad():
@@ -325,6 +372,7 @@ class ConceptFeatureMapNode(io.ComfyNode):
         feat_dict = {}
         dict_path = dict_path.strip() if dict_path else ""
         if dict_path:
+            # Manual dictionary file provided
             if not os.path.isabs(dict_path):
                 dict_path = str(_PACKAGE_ROOT / dict_path)
             if os.path.isfile(dict_path):
@@ -335,14 +383,33 @@ class ConceptFeatureMapNode(io.ComfyNode):
                 _log(f"Loaded feature dictionary: {len(feat_dict)} entries")
             else:
                 _log(f"Feature dictionary not found: {dict_path}")
+        elif is_transcoder and transcoder_repo:
+            # Auto-load labels from transcoder repo's feature dictionary
+            try:
+                from lens_factory import load_transcoder_feature_labels
+                tc_labels = load_transcoder_feature_labels(
+                    feature_indices=top_indices,
+                    layer=22,
+                    repo_id=transcoder_repo,
+                )
+                if tc_labels:
+                    feat_dict = {
+                        str(idx): {"label": label}
+                        for idx, label in tc_labels.items()
+                    }
+                    _log(
+                        f"Auto-loaded {len(feat_dict)} feature labels from transcoder dictionary")
+            except Exception as e:
+                _log(f"Could not load transcoder feature dictionary: {e}")
 
         # ── Build text output ──
         has_labels = bool(feat_dict)
+        tc_label = "Transcoder" if is_transcoder else "SAE"
         lines = [
-            f"SAE Feature Decomposition",
+            f"{tc_label} Feature Decomposition",
             f"Conditioning: {cond_dim}d × {n_tokens} tokens",
-            f"SAE: {d_sae} features ({sae_expansion}×)",
-            f"Active features: {active_count} / {d_sae}",
+            f"{tc_label}: {d_sae:,} features ({actual_expansion}×)",
+            f"Active features: {active_count:,} / {d_sae:,}",
             f"Pool mode: {pool_mode}",
         ]
         if has_labels:
@@ -390,7 +457,7 @@ class ConceptFeatureMapNode(io.ComfyNode):
                 ]
             chart = _generate_feature_chart(
                 top_indices, top_values,
-                title=f"SAE Feature Activations ({active_count} active)",
+                title=f"{tc_label} Feature Activations ({active_count:,} active)",
                 max_display=min(top_k, 40),
                 labels=chart_labels,
             )

@@ -5,13 +5,13 @@ Lens Factory — Generate concept steering lenses for ComfyUI Concept Steer.
 Creates direction vectors that steer image generation toward learned aesthetic
 concepts. Two extraction methods:
 
-  DPO:  Optimize a separating hyperplane between positive/negative embeddings.
+  Contrastive:  Optimize a separating hyperplane between positive/negative embeddings.
         Fast, simple, works well. Operates on output embeddings only.
 
   SAE:  Train a Sparse Autoencoder on the text encoder's residual stream,
         decompose activations into interpretable features, find which features
         fire differentially for the concept, then reconstruct a clean direction
-        from those features. Optionally refine with DPO for robust separation.
+        from those features. Optionally refine with Contrastive for robust separation.
         Gives interpretable, disentangled concept directions.
 
 Modes:
@@ -70,7 +70,7 @@ QWEN_HIDDEN_DIM = 2560
 #  Core Direction Training
 # ═════════════════════════════════════════════════════════════════════════════
 
-def train_dpo_direction(
+def train_contrastive_direction(
     h_positive: torch.Tensor,
     h_negative: torch.Tensor,
     dim: int,
@@ -80,7 +80,7 @@ def train_dpo_direction(
     min_accuracy: float = 0.98,
     verbose: bool = True,
 ) -> dict:
-    """Train a DPO direction that separates positive from negative embeddings.
+    """Train a Contrastive direction that separates positive from negative embeddings.
 
     Sweeps over beta values and selects the one with the highest minimum margin
     (most robust separation) among those achieving >= min_accuracy.
@@ -89,7 +89,7 @@ def train_dpo_direction(
         h_positive: (N, dim) positive concept embeddings
         h_negative: (N, dim) negative concept embeddings
         dim: embedding dimension
-        betas: DPO temperature values to sweep
+        betas: Contrastive temperature values to sweep
         steps: optimization steps per beta
         lr: learning rate
         min_accuracy: minimum accuracy threshold
@@ -99,7 +99,7 @@ def train_dpo_direction(
         dict with 'direction', 'beta', 'accuracy', 'mean_margin', 'min_margin'
     """
     if verbose:
-        print(f"  DPO training: {h_positive.shape[0]} pairs x {dim}d")
+        print(f"  Contrastive training: {h_positive.shape[0]} pairs x {dim}d")
 
     results = {}
     # Exit inference_mode — ComfyUI wraps node execution in inference_mode()
@@ -320,6 +320,310 @@ def train_sae(
                 )
 
     return sae.eval()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  Pretrained SAE / Transcoder Loading
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Default HuggingFace transcoder repo for Qwen3-4B
+DEFAULT_TRANSCODER_REPO = "mwhanna/qwen3-4b-transcoders"
+TRANSCODER_CACHE_DIR = PACKAGE_ROOT / "sae" / "transcoders"
+
+
+def download_transcoder_layer(
+    layer: int = 22,
+    repo_id: str = DEFAULT_TRANSCODER_REPO,
+    cache_dir: Optional[Path] = None,
+) -> Path:
+    """Download a single transcoder layer from HuggingFace.
+
+    Args:
+        layer: layer index (default 22, our target layer)
+        repo_id: HuggingFace repo ID
+        cache_dir: local cache directory
+
+    Returns:
+        Path to downloaded safetensors file
+    """
+    cache_dir = Path(cache_dir or TRANSCODER_CACHE_DIR)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = f"layer_{layer}.safetensors"
+    local_path = cache_dir / f"{repo_id.replace('/', '_')}_{filename}"
+
+    if local_path.exists():
+        print(f"  Transcoder layer {layer} cached: {local_path}")
+        return local_path
+
+    print(f"  Downloading transcoder layer {layer} from {repo_id}...")
+    print(f"  (this is ~1.7GB, only needed once)")
+
+    try:
+        from huggingface_hub import hf_hub_download
+        downloaded = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            cache_dir=str(cache_dir / ".hf_cache"),
+            local_dir=str(cache_dir),
+            local_dir_use_symlinks=False,
+        )
+        dl_path = Path(downloaded)
+        if dl_path != local_path:
+            import shutil
+            shutil.copy2(dl_path, local_path)
+        print(f"  Downloaded to {local_path}")
+        return local_path
+
+    except ImportError:
+        raise RuntimeError(
+            "huggingface_hub required for transcoder download.\n"
+            "  pip install huggingface_hub\n"
+            f"Or manually download: https://huggingface.co/{repo_id}/resolve/main/{filename}"
+        )
+
+
+# ── Transcoder Feature Dictionary ────────────────────────────────────────────
+FEATURE_DICT_CACHE_DIR = PACKAGE_ROOT / "sae" / "transcoders" / "features"
+
+
+def download_transcoder_feature_dict(
+    layer: int = 22,
+    repo_id: str = DEFAULT_TRANSCODER_REPO,
+    cache_dir: Optional[Path] = None,
+) -> tuple[Path, Path]:
+    """Download the feature dictionary index + bin for a single layer.
+
+    Returns:
+        (index_path, bin_path) tuple
+    """
+    cache_dir = Path(cache_dir or FEATURE_DICT_CACHE_DIR)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    repo_prefix = repo_id.replace("/", "_")
+    index_local = cache_dir / f"{repo_prefix}_index.json.gz"
+    bin_local = cache_dir / f"{repo_prefix}_layer_{layer}.bin"
+
+    try:
+        from huggingface_hub import hf_hub_download
+    except ImportError:
+        raise RuntimeError("huggingface_hub required for feature dictionary download")
+
+    # Download index (~24 MB compressed)
+    if not index_local.exists():
+        print(f"  Downloading feature dictionary index from {repo_id}...")
+        dl = hf_hub_download(
+            repo_id=repo_id,
+            filename="features/index.json.gz",
+            cache_dir=str(cache_dir / ".hf_cache"),
+            local_dir=str(cache_dir),
+            local_dir_use_symlinks=False,
+        )
+        dl_path = Path(dl)
+        if dl_path != index_local:
+            import shutil
+            shutil.copy2(dl_path, index_local)
+        print(f"  Index cached: {index_local}")
+
+    # Download layer bin (~1 GB)
+    if not bin_local.exists():
+        print(f"  Downloading feature dictionary for layer {layer} (~1 GB, only needed once)...")
+        dl = hf_hub_download(
+            repo_id=repo_id,
+            filename=f"features/layer_{layer}.bin",
+            cache_dir=str(cache_dir / ".hf_cache"),
+            local_dir=str(cache_dir),
+            local_dir_use_symlinks=False,
+        )
+        dl_path = Path(dl)
+        if dl_path != bin_local:
+            import shutil
+            shutil.copy2(dl_path, bin_local)
+        print(f"  Feature dict cached: {bin_local}")
+
+    return index_local, bin_local
+
+
+def load_transcoder_feature_labels(
+    feature_indices: list[int],
+    layer: int = 22,
+    repo_id: str = DEFAULT_TRANSCODER_REPO,
+    cache_dir: Optional[Path] = None,
+) -> dict[int, str]:
+    """Load semantic labels for specific features from the transcoder dictionary.
+
+    Only reads the specific feature entries needed (random-access into the bin
+    file), so it's fast even with 163K total features.
+
+    Args:
+        feature_indices: list of feature indices to look up
+        layer: transcoder layer (default 22)
+        repo_id: HuggingFace repo ID
+        cache_dir: local cache directory
+
+    Returns:
+        dict mapping feature_index -> label string built from top logit tokens
+    """
+    import gzip
+    import json
+    import struct
+
+    cache_dir = Path(cache_dir or FEATURE_DICT_CACHE_DIR)
+    repo_prefix = repo_id.replace("/", "_")
+    index_path = cache_dir / f"{repo_prefix}_index.json.gz"
+    bin_path = cache_dir / f"{repo_prefix}_layer_{layer}.bin"
+
+    # Ensure files exist
+    if not index_path.exists() or not bin_path.exists():
+        try:
+            download_transcoder_feature_dict(layer, repo_id, cache_dir)
+        except Exception as e:
+            print(f"  Warning: Could not download feature dictionary: {e}")
+            return {}
+
+    # Load offsets
+    with gzip.open(str(index_path), "rt") as f:
+        index_data = json.load(f)
+
+    layer_info = index_data.get(str(layer))
+    if not layer_info:
+        print(f"  Warning: Layer {layer} not in feature dictionary index")
+        return {}
+
+    offsets = layer_info["offsets"]
+    labels: dict[int, str] = {}
+
+    with open(bin_path, "rb") as f:
+        for idx in feature_indices:
+            if idx < 0 or idx >= len(offsets) - 1:
+                continue
+            try:
+                f.seek(offsets[idx])
+                chunk_len = offsets[idx + 1] - offsets[idx]
+                chunk = f.read(chunk_len)
+                # 4-byte compressed-size header, then gzip JSON
+                decompressed = gzip.decompress(chunk[4:])
+                entry = json.loads(decompressed)
+
+                # Build label from top logits
+                top_logits = entry.get("top_logits", [])
+                if top_logits:
+                    # Combine top 3 logit tokens as label
+                    tokens = [t.strip() for t in top_logits[:3] if t.strip()]
+                    label = " | ".join(tokens) if tokens else f"F{idx}"
+                else:
+                    label = f"F{idx}"
+
+                # Add activation frequency hint
+                freq = entry.get("activation_frequency", 0)
+                if freq > 0:
+                    if freq > 0.01:
+                        label += " (common)"
+                    elif freq < 0.0001:
+                        label += " (rare)"
+
+                labels[idx] = label
+            except Exception:
+                # Skip features we can't decode
+                continue
+
+    return labels
+
+
+def load_sae_or_transcoder(
+    path: str | Path,
+    d_model: int = QWEN_HIDDEN_DIM,
+    expected_expansion: Optional[int] = None,
+) -> SparseAutoencoder:
+    """Load a pretrained SAE or transcoder, auto-detecting the format.
+
+    Supports:
+      1. Our native SparseAutoencoder state dicts (.pt) — keys: encoder.weight, etc.
+      2. Transcoder safetensors — keys: W_enc, W_dec, b_enc, b_dec
+      3. Transcoder .pt — keys: W_enc, W_dec, b_enc, b_dec
+
+    Auto-detects dimensions from weight shapes. Returns a SparseAutoencoder
+    that can be used identically to our trained SAEs.
+
+    Args:
+        path: path to .safetensors or .pt file
+        d_model: expected model hidden dim (for validation)
+        expected_expansion: if set, validate expansion factor
+
+    Returns:
+        SparseAutoencoder in eval mode on DEVICE
+    """
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"SAE/transcoder not found: {path}")
+
+    # ── Load weights ──
+    if path.suffix == ".safetensors":
+        from safetensors import safe_open
+        sf = safe_open(str(path), framework="pt", device=str(DEVICE))
+        state = {k: sf.get_tensor(k) for k in sf.keys()}
+    else:
+        state = torch.load(str(path), map_location=DEVICE, weights_only=True)
+
+    # ── Detect format ──
+    keys = set(state.keys())
+
+    # Format 1: Our native SparseAutoencoder (nn.Linear keys)
+    if "encoder.weight" in keys:
+        d_sae, d_in = state["encoder.weight"].shape
+        sae = SparseAutoencoder(d_in, d_sae).to(DEVICE)
+        sae.load_state_dict(state)
+        sae.eval()
+        expansion = d_sae // d_in
+        print(f"  Loaded native SAE: {d_in}d → {d_sae}d ({expansion}x)")
+        return sae
+
+    # Format 2: Transcoder format (W_enc, W_dec, etc.)
+    if "W_enc" in keys:
+        W_enc = state["W_enc"]  # [d_feature, d_model]
+        W_dec = state["W_dec"]  # [d_feature, d_model] (already transposed in repo)
+        b_enc = state.get("b_enc")  # [d_feature] — may not exist
+        b_dec = state.get("b_dec")  # [d_model] — may not exist
+
+        d_feature, d_in = W_enc.shape
+        expansion = d_feature // d_in
+
+        print(f"  Loaded transcoder: {d_in}d → {d_feature}d ({expansion}x, "
+              f"{d_feature:,} features)")
+
+        if d_in != d_model:
+            print(f"  WARNING: transcoder d_model={d_in} != expected {d_model}")
+
+        if expected_expansion and expansion != expected_expansion:
+            print(f"  NOTE: expansion {expansion}x != expected {expected_expansion}x "
+                  f"(auto-adjusting)")
+
+        # Wrap in our SparseAutoencoder interface
+        sae = SparseAutoencoder(d_in, d_feature, l1_coeff=0).to(DEVICE)
+
+        with torch.no_grad():
+            # encoder: nn.Linear weight is [out, in], matches W_enc [d_feature, d_model]
+            sae.encoder.weight.copy_(W_enc)
+            if b_enc is not None:
+                sae.encoder.bias.copy_(b_enc)
+            else:
+                sae.encoder.bias.zero_()
+
+            # decoder: nn.Linear weight is [out, in] = [d_model, d_feature]
+            # W_dec from transcoder is [d_feature, d_model], so transpose it
+            sae.decoder.weight.copy_(W_dec.T)
+            if b_dec is not None:
+                sae.decoder.bias.copy_(b_dec)
+            else:
+                sae.decoder.bias.zero_()
+
+        sae.eval()
+        return sae
+
+    raise ValueError(
+        f"Unknown SAE/transcoder format. Keys: {sorted(keys)[:10]}...\n"
+        f"Expected either 'encoder.weight' (native) or 'W_enc' (transcoder)."
+    )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -590,7 +894,22 @@ def load_qwen_encoder(encoder_path: str = ""):
 
     # Auto-discover from common locations if not explicitly set
     if not path or not os.path.isfile(path):
+        # Try ComfyUI's folder_paths API first (picks up extra_model_paths.yaml)
+        _comfy_dirs: list[str] = []
+        try:
+            import folder_paths  # type: ignore
+            for folder_type in ("text_encoders", "clip"):
+                try:
+                    dirs = folder_paths.get_folder_paths(folder_type)
+                    _comfy_dirs.extend(dirs)
+                except Exception:
+                    pass
+        except ImportError:
+            pass
+
         _search_paths = [
+            # ComfyUI folder_paths API results
+            *[str(Path(d) / "qwen_3_4b.safetensors") for d in _comfy_dirs],
             # Relative to ComfyUI install (custom_nodes/../models/)
             *[
                 str(p)
@@ -846,7 +1165,7 @@ def generate_lens_from_text_pairs(
     target: str = "zimage",
     include_bridge: bool = True,
     output_dir: Optional[Path] = None,
-    dpo_steps: int = 500,
+    contrastive_steps: int = 500,
 ) -> Path:
     """Generate a lens from explicit positive/negative text pairs.
 
@@ -857,7 +1176,7 @@ def generate_lens_from_text_pairs(
         target: "zimage" (2560d Qwen) or "sd15" (768d SigLIP)
         include_bridge: train SigLIP->Qwen bridge (for cross-modal use)
         output_dir: override output directory
-        dpo_steps: DPO optimization steps
+        contrastive_steps: Contrastive optimization steps
 
     Returns:
         Path to exported lens file
@@ -878,9 +1197,9 @@ def generate_lens_from_text_pairs(
         print("[2/4] Encoding negative texts through Qwen 3.4B...")
         h_neg = encode_texts_qwen(negative_texts)
 
-        print("[3/4] Training DPO direction (2560d)...")
-        dpo = train_dpo_direction(
-            h_pos, h_neg, dim=QWEN_HIDDEN_DIM, steps=dpo_steps)
+        print("[3/4] Training Contrastive direction (2560d)...")
+        ctr = train_contrastive_direction(
+            h_pos, h_neg, dim=QWEN_HIDDEN_DIM, steps=contrastive_steps)
 
         bridge_data = {}
         if include_bridge:
@@ -898,7 +1217,7 @@ def generate_lens_from_text_pairs(
             with torch.no_grad():
                 proj_pos = proj(sig_embeds[0::2].to(DEVICE))
                 proj_neg = proj(sig_embeds[1::2].to(DEVICE))
-                d_dev = dpo["direction"].to(DEVICE)
+                d_dev = ctr["direction"].to(DEVICE)
                 cross_margins = (proj_pos @ d_dev) - (proj_neg @ d_dev)
                 cross_acc = (cross_margins > 0).float().mean().item()
                 print(f"  Cross-modal direction transfer: {cross_acc:.0%}")
@@ -918,12 +1237,12 @@ def generate_lens_from_text_pairs(
             print("[4/4] Skipping bridge (not requested)")
 
         lens_data = {
-            "direction": dpo["direction"],
+            "direction": ctr["direction"],
             "direction_dim": QWEN_HIDDEN_DIM,
-            "dpo_beta": dpo["beta"],
-            "dpo_accuracy": dpo["accuracy"],
-            "dpo_mean_margin": dpo["mean_margin"],
-            "dpo_min_margin": dpo["min_margin"],
+            "contrastive_beta": ctr["beta"],
+            "contrastive_accuracy": ctr["accuracy"],
+            "contrastive_mean_margin": ctr["mean_margin"],
+            "contrastive_min_margin": ctr["min_margin"],
             "encoder_name": "qwen_3_4b",
             "encoder_hidden_dim": QWEN_HIDDEN_DIM,
             "encoder_type": "Qwen3Model",
@@ -943,17 +1262,17 @@ def generate_lens_from_text_pairs(
         print("[2/3] Encoding negative texts through SigLIP...")
         h_neg = encode_texts_siglip(negative_texts)
 
-        print("[3/3] Training DPO direction (768d)...")
-        dpo = train_dpo_direction(
-            h_pos, h_neg, dim=SIGLIP_DIM, steps=dpo_steps)
+        print("[3/3] Training Contrastive direction (768d)...")
+        ctr = train_contrastive_direction(
+            h_pos, h_neg, dim=SIGLIP_DIM, steps=contrastive_steps)
 
         lens_data = {
-            "direction": dpo["direction"],
+            "direction": ctr["direction"],
             "direction_dim": SIGLIP_DIM,
-            "dpo_beta": dpo["beta"],
-            "dpo_accuracy": dpo["accuracy"],
-            "dpo_mean_margin": dpo["mean_margin"],
-            "dpo_min_margin": dpo["min_margin"],
+            "contrastive_beta": ctr["beta"],
+            "contrastive_accuracy": ctr["accuracy"],
+            "contrastive_mean_margin": ctr["mean_margin"],
+            "contrastive_min_margin": ctr["min_margin"],
             "encoder_name": "siglip-base-patch16-224",
             "encoder_dim": SIGLIP_DIM,
             "target_model": "sd15",
@@ -968,7 +1287,7 @@ def generate_lens_from_text_pairs(
 
     # Save lens
     out_dir.mkdir(parents=True, exist_ok=True)
-    lens_name = f"{concept}_{target}_dpo"
+    lens_name = f"{concept}_{target}_contrastive"
     lens_path = out_dir / f"{lens_name}.pt"
     torch.save(lens_data, lens_path)
 
@@ -979,10 +1298,10 @@ def generate_lens_from_text_pairs(
         "direction_dim": lens_data["direction_dim"],
         "training_mode": "text_pairs",
         "n_pairs": len(positive_texts),
-        "dpo_beta": dpo["beta"],
-        "dpo_accuracy": dpo["accuracy"],
-        "dpo_mean_margin": dpo["mean_margin"],
-        "dpo_min_margin": dpo["min_margin"],
+        "contrastive_beta": ctr["beta"],
+        "contrastive_accuracy": ctr["accuracy"],
+        "contrastive_mean_margin": ctr["mean_margin"],
+        "contrastive_min_margin": ctr["min_margin"],
         "training_time_s": round(time.time() - t0, 1),
     }
     meta_path = out_dir / f"{lens_name}_metadata.json"
@@ -1001,28 +1320,77 @@ def generate_lens_from_images(
     negative_dir: Optional[str] = None,
     target: str = "sd15",
     n_negative_random: int = 0,
+    use_contrastive: bool = True,
+    contrastive_steps: int = 500,
+    use_vl_captions: bool = False,
+    vl_model: Optional[str] = None,
     output_dir: Optional[Path] = None,
 ) -> Path:
     """Generate a lens from few-shot example images.
 
-    Computes mean SigLIP embedding of positive images, subtracts mean of
-    negatives (or origin), and normalizes to get a direction vector.
+    Three modes of operation (from weakest to strongest):
 
-    For 'zimage' target, projects through a pre-trained SigLIP->Qwen bridge
-    if one exists in an existing lens file.
+      1. Centroid (use_contrastive=False, use_vl_captions=False):
+         Simple mean difference. Fast but weak — just subtracts centroids.
+
+      2. Contrastive (use_contrastive=True, use_vl_captions=False):
+         Encodes images via SigLIP, then runs contrastive paired-margin
+         optimization on the embeddings for robust separation. Much
+         stronger than centroid subtraction.
+
+      3. VL Captioning (use_vl_captions=True):
+         Uses a VL model to caption each image, then runs contrastive
+         training on the captions through the native text encoder (Qwen).
+         Bypasses the lossy SigLIP→Qwen bridge entirely. Best quality
+         for zimage target but requires a VL model to be available.
+
+    Args:
+        concept: concept name
+        positive_dir: directory of images embodying the concept
+        negative_dir: optional directory of images without the concept
+        target: "sd15" or "zimage"
+        n_negative_random: number of random negatives if no negative_dir
+        use_contrastive: apply contrastive optimization (recommended)
+        contrastive_steps: optimization steps for contrastive refinement
+        use_vl_captions: caption images with a VL model and train on text
+        vl_model: VL model name/path (default: auto-detect)
+        output_dir: override output directory
     """
     print(f"\n{'='*60}")
     print(f"  Lens Factory (Few-Shot): '{concept}' ({target})")
+    mode_label = "VL-Caption" if use_vl_captions else (
+        "Contrastive" if use_contrastive else "Centroid")
+    print(f"  Mode: {mode_label}")
     print(f"{'='*60}\n")
 
     t0 = time.time()
 
     pos_images = collect_images(positive_dir)
-    print(
-        f"[1/3] Found {len(pos_images)} positive images — encoding with SigLIP...")
+    print(f"[1/4] Found {len(pos_images)} positive images")
     if len(pos_images) < 2:
         raise ValueError(
             f"Need at least 2 positive images, found {len(pos_images)}")
+
+    neg_images_list = None
+    if negative_dir:
+        neg_images_list = collect_images(negative_dir)
+        print(f"  Found {len(neg_images_list)} negative images")
+
+    # ── VL Captioning path ───────────────────────────────────────────────
+    if use_vl_captions:
+        return _generate_lens_vl_caption(
+            concept=concept,
+            pos_images=pos_images,
+            neg_images=neg_images_list,
+            target=target,
+            contrastive_steps=contrastive_steps,
+            vl_model=vl_model,
+            output_dir=output_dir,
+            t0=t0,
+        )
+
+    # ── SigLIP embedding path ────────────────────────────────────────────
+    print(f"[2/4] Encoding positive images with SigLIP...")
     h_pos = encode_images_siglip(pos_images)
     mean_pos = F.normalize(h_pos.mean(dim=0), dim=0)
     print(f"  Positive centroid norm: {h_pos.mean(0).norm():.3f}")
@@ -1030,35 +1398,63 @@ def generate_lens_from_images(
         f"  Intra-positive cosine: {F.cosine_similarity(h_pos, mean_pos.unsqueeze(0)).mean():.3f}")
 
     if negative_dir:
-        neg_images = collect_images(negative_dir)
-        print(f"[2/3] Found {len(neg_images)} negative images — encoding...")
-        h_neg = encode_images_siglip(neg_images)
+        print(f"  Encoding {len(neg_images_list)} negative images...")
+        h_neg = encode_images_siglip(neg_images_list)
         mean_neg = F.normalize(h_neg.mean(dim=0), dim=0)
     elif n_negative_random > 0:
         print(
-            f"[2/3] Generating {n_negative_random} random negative vectors...")
+            f"  Generating {n_negative_random} random negative vectors...")
         h_neg = torch.randn(n_negative_random, SIGLIP_DIM)
         h_neg = F.normalize(h_neg, dim=-1)
         mean_neg = F.normalize(h_neg.mean(dim=0), dim=0)
     else:
-        print("[2/3] No negatives — using origin as contrast")
+        print("  No negatives — using origin as contrast")
         h_neg = None
         mean_neg = torch.zeros(SIGLIP_DIM)
 
-    raw_direction = mean_pos - mean_neg
-    direction = F.normalize(raw_direction, dim=0)
+    # ── Direction extraction ─────────────────────────────────────────────
+    if use_contrastive and h_neg is not None and len(h_pos) >= 2 and len(h_neg) >= 2:
+        # Contrastive: paired margin optimization on SigLIP embeddings
+        # Need equal-sized sets — pair by index, wrapping shorter set
+        n_pairs = max(len(h_pos), len(h_neg))
+        h_pos_paired = h_pos[torch.arange(n_pairs) % len(h_pos)]
+        h_neg_paired = h_neg[torch.arange(n_pairs) % len(h_neg)]
 
-    pos_scores = h_pos @ direction
-    if negative_dir:
-        neg_scores = h_neg @ direction
-        acc = ((pos_scores > neg_scores.mean()).float().mean().item())
+        print(
+            f"[3/4] Contrastive optimization ({n_pairs} pairs, {contrastive_steps} steps)...")
+        contrastive = train_contrastive_direction(
+            h_pos_paired, h_neg_paired,
+            dim=SIGLIP_DIM,
+            steps=contrastive_steps,
+            verbose=True,
+        )
+        direction = contrastive["direction"]
+        acc = contrastive["accuracy"]
+        extra_meta = {
+            "contrastive_beta": contrastive["beta"],
+            "contrastive_accuracy": contrastive["accuracy"],
+            "contrastive_mean_margin": contrastive["mean_margin"],
+            "contrastive_min_margin": contrastive["min_margin"],
+        }
+        print(f"  Contrastive accuracy: {acc:.0%}")
     else:
-        acc = (pos_scores > 0).float().mean().item()
-    print(f"  Direction accuracy: {acc:.0%}")
-    print(f"  Positive mean score: {pos_scores.mean():.3f}")
+        # Centroid subtraction fallback
+        print("[3/4] Computing centroid direction...")
+        raw_direction = mean_pos - mean_neg
+        direction = F.normalize(raw_direction, dim=0)
+        pos_scores = h_pos @ direction
+        if h_neg is not None:
+            neg_scores = h_neg @ direction
+            acc = ((pos_scores > neg_scores.mean()).float().mean().item())
+        else:
+            acc = (pos_scores > 0).float().mean().item()
+        extra_meta = {}
+        print(f"  Centroid accuracy: {acc:.0%}")
+
+    print(f"  Positive mean score: {(h_pos @ direction).mean():.3f}")
 
     if target == "sd15":
-        print("[3/3] Exporting SigLIP-space lens (768d)...")
+        print("[4/4] Exporting SigLIP-space lens (768d)...")
         lens_data = {
             "direction": direction,
             "d_in_siglip": direction,
@@ -1066,16 +1462,17 @@ def generate_lens_from_images(
             "encoder_name": "siglip-base-patch16-224",
             "concept": concept,
             "n_positive_images": len(pos_images),
-            "n_negative_images": len(neg_images) if negative_dir else 0,
+            "n_negative_images": len(neg_images_list) if negative_dir else 0,
             "training_mode": "few_shot_images",
             "accuracy": acc,
             "target_model": "sd15",
+            **extra_meta,
         }
         out_dir = output_dir or (LENS_DIR / "sd15")
         lens_name = f"{concept}_sd15_fewshot"
 
     elif target == "zimage":
-        print("[3/3] Projecting to Qwen space for Z Image...")
+        print("[4/4] Projecting to Qwen space for Z Image...")
         # Look for an existing bridge in any zimage lens
         bridge_found = False
         zimage_dir = LENS_DIR / "zimage"
@@ -1102,7 +1499,8 @@ def generate_lens_from_images(
                     continue
 
         if not bridge_found:
-            print("  No bridge found — storing SigLIP direction only")
+            print("  WARNING: No bridge found — storing SigLIP direction only.")
+            print("  Consider using --use-vl-captions for native Qwen-space directions.")
             direction_qwen = direction
 
         lens_data = {
@@ -1112,12 +1510,13 @@ def generate_lens_from_images(
             "encoder_name": "qwen_3_4b" if bridge_found else "siglip",
             "concept": concept,
             "n_positive_images": len(pos_images),
-            "n_negative_images": len(neg_images) if negative_dir else 0,
+            "n_negative_images": len(neg_images_list) if negative_dir else 0,
             "training_mode": "few_shot_images",
             "accuracy": acc,
             "target_model": "z_image_turbo",
             "siglip_model": SIGLIP_MODEL_ID,
             "siglip_dim": SIGLIP_DIM,
+            **extra_meta,
         }
         out_dir = output_dir or (LENS_DIR / "zimage")
         lens_name = f"{concept}_zimage_fewshot"
@@ -1133,11 +1532,14 @@ def generate_lens_from_images(
         "concept": concept,
         "target": target,
         "training_mode": "few_shot_images",
+        "training_method": mode_label.lower(),
         "n_positive_images": len(pos_images),
-        "n_negative_images": len(neg_images) if negative_dir else 0,
+        "n_negative_images": len(neg_images_list) if negative_dir else 0,
         "direction_dim": int(lens_data["direction_dim"]),
         "accuracy": float(acc),
         "training_time_s": round(time.time() - t0, 1),
+        **{k: float(v) if isinstance(v, (int, float)) else v
+           for k, v in extra_meta.items()},
     }
     meta_path = out_dir / f"{lens_name}_metadata.json"
     with open(meta_path, "w") as f:
@@ -1147,6 +1549,282 @@ def generate_lens_from_images(
     print(f"  Size: {lens_path.stat().st_size / 1e6:.1f} MB")
     print(f"  Total time: {time.time() - t0:.1f}s")
     return lens_path
+
+
+# ── VL Captioning Pipeline for Few-Shot ─────────────────────────────────────
+
+def _load_vl_model(model_name: Optional[str] = None):
+    """Load a vision-language model for captioning.
+
+    Tries (in order):
+      1. User-specified model_name
+      2. Qwen2.5-VL (best quality, needs ~8GB VRAM)
+      3. InternVL2 (good quality, lighter)
+      4. Florence-2 (light, ~1.5GB)
+
+    Returns:
+        (model, processor, caption_fn) where caption_fn(images) -> list[str]
+    """
+    if model_name is None:
+        # Auto-detect best available
+        candidates = [
+            "Qwen/Qwen2.5-VL-7B-Instruct",
+            "Qwen/Qwen2.5-VL-3B-Instruct",
+            "microsoft/Florence-2-large",
+        ]
+    else:
+        candidates = [model_name]
+
+    for name in candidates:
+        try:
+            if "qwen" in name.lower() and "vl" in name.lower():
+                return _load_qwen_vl(name)
+            elif "florence" in name.lower():
+                return _load_florence(name)
+            else:
+                # Try as generic transformers model
+                return _load_generic_vl(name)
+        except Exception as e:
+            print(f"  Could not load {name}: {e}")
+            continue
+
+    raise RuntimeError(
+        "No VL model available. Install one of:\n"
+        "  pip install qwen-vl-utils transformers>=4.40\n"
+        "  pip install transformers  (for Florence-2)\n"
+        "Or specify --vl-model with a model path."
+    )
+
+
+def _load_qwen_vl(model_name: str):
+    """Load Qwen2/Qwen2.5-VL for captioning."""
+    from transformers import AutoProcessor
+
+    # Qwen2.5-VL needs its own class; fall back to Qwen2VL for older models
+    try:
+        from transformers import Qwen2_5_VLForConditionalGeneration as QwenVLCls
+    except ImportError:
+        from transformers import Qwen2VLForConditionalGeneration as QwenVLCls
+
+    print(f"  Loading VL model: {model_name}...")
+    processor = AutoProcessor.from_pretrained(
+        model_name, trust_remote_code=True)
+    model = QwenVLCls.from_pretrained(
+        model_name, dtype=torch.bfloat16, device_map="auto",
+        trust_remote_code=True,
+    )
+
+    def caption_fn(image_paths: list[str], detail: str = "concept") -> list[str]:
+        from PIL import Image
+
+        prompt = (
+            "Describe this image in one detailed paragraph for an AI image generator. "
+            "Focus on visual style, lighting, composition, colors, mood, textures, "
+            "and notable aesthetic qualities. Be specific about visual attributes. "
+            "Do not mention any text, watermarks, or UI elements visible in the image."
+        )
+
+        captions = []
+        for path in image_paths:
+            img = Image.open(path).convert("RGB")
+            messages = [
+                {"role": "user", "content": [
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": prompt},
+                ]}
+            ]
+            text = processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+            inputs = processor(text=[text], images=[
+                               img], return_tensors="pt").to(model.device)
+            with torch.no_grad():
+                ids = model.generate(**inputs, max_new_tokens=256)
+            output = processor.batch_decode(
+                ids[:, inputs.input_ids.shape[1]:], skip_special_tokens=True)[0]
+            captions.append(output.strip())
+            print(f"    {Path(path).name}: {output.strip()[:80]}...")
+        return captions
+
+    return model, processor, caption_fn
+
+
+def _load_florence(model_name: str):
+    """Load Florence-2 for captioning."""
+    from transformers import AutoModelForCausalLM, AutoProcessor
+
+    print(f"  Loading VL model: {model_name}...")
+    processor = AutoProcessor.from_pretrained(
+        model_name, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name, torch_dtype=torch.float16, trust_remote_code=True,
+        attn_implementation="eager",  # Florence-2 doesn't support SDPA
+    ).to(DEVICE)
+
+    def caption_fn(image_paths: list[str], detail: str = "concept") -> list[str]:
+        from PIL import Image
+
+        captions = []
+        for path in image_paths:
+            img = Image.open(path).convert("RGB")
+            prompt = "<MORE_DETAILED_CAPTION>"
+            inputs = processor(text=prompt, images=img,
+                               return_tensors="pt").to(DEVICE)
+            with torch.no_grad():
+                ids = model.generate(
+                    **inputs, max_new_tokens=256, num_beams=3,
+                    do_sample=False,
+                )
+            output = processor.batch_decode(ids, skip_special_tokens=True)[0]
+            # Florence returns task token + output, strip task token
+            output = output.replace("<MORE_DETAILED_CAPTION>", "").strip()
+            captions.append(output)
+            print(f"    {Path(path).name}: {output[:80]}...")
+        return captions
+
+    return model, processor, caption_fn
+
+
+def _load_generic_vl(model_name: str):
+    """Attempt to load a generic VL model via transformers pipeline."""
+    from transformers import pipeline
+
+    print(f"  Loading VL model: {model_name}...")
+    pipe = pipeline("image-to-text", model=model_name, device=DEVICE,
+                    torch_dtype=torch.float16, trust_remote_code=True)
+
+    def caption_fn(image_paths: list[str], detail: str = "concept") -> list[str]:
+        from PIL import Image
+
+        captions = []
+        for path in image_paths:
+            img = Image.open(path).convert("RGB")
+            result = pipe(img, max_new_tokens=256)
+            caption = result[0]["generated_text"].strip()
+            captions.append(caption)
+            print(f"    {Path(path).name}: {caption[:80]}...")
+        return captions
+
+    return None, None, caption_fn
+
+
+def _generate_lens_vl_caption(
+    concept: str,
+    pos_images: list[str],
+    neg_images: Optional[list[str]],
+    target: str,
+    contrastive_steps: int,
+    vl_model: Optional[str],
+    output_dir: Optional[Path],
+    t0: float,
+) -> Path:
+    """Few-shot via VL captioning → contrastive training in native text-encoder space.
+
+    This is the strongest few-shot method because it:
+    1. Uses a VL model to extract rich text descriptions of what makes images special
+    2. Trains in native Qwen text-encoder space (no lossy SigLIP→Qwen projection)
+    3. Applies full contrastive paired-margin optimization
+
+    The VL model captions each positive image with a detailed style description,
+    then generates "neutral" counterparts by re-captioning with style stripped.
+    """
+    print(f"[2/4] Loading VL model for captioning...")
+    _, _, caption_fn = _load_vl_model(vl_model)
+
+    print(f"\n[3/4] Captioning {len(pos_images)} positive images...")
+    pos_captions = caption_fn(pos_images)
+
+    if neg_images and len(neg_images) >= 2:
+        print(f"  Captioning {len(neg_images)} negative images...")
+        neg_captions = caption_fn(neg_images)
+
+        # Ensure equal pairs
+        n = min(len(pos_captions), len(neg_captions))
+        pos_captions = pos_captions[:n]
+        neg_captions = neg_captions[:n]
+    else:
+        # Generate neutral counterparts for each positive caption
+        print("  Generating neutral counterpart captions...")
+        neg_captions = _generate_neutral_captions(pos_captions)
+
+    print(f"\n  Positive captions: {len(pos_captions)}")
+    print(f"  Negative captions: {len(neg_captions)}")
+
+    # Now run standard text-pair contrastive training
+    print(f"\n[4/4] Training contrastive direction from VL captions...")
+    lens_path = generate_lens_from_text_pairs(
+        concept=concept,
+        positive_texts=pos_captions,
+        negative_texts=neg_captions,
+        target=target,
+        include_bridge=(target == "zimage"),
+        output_dir=output_dir,
+        contrastive_steps=contrastive_steps,
+    )
+
+    # Re-save metadata to note this was VL-captioned
+    out_dir = output_dir or (
+        LENS_DIR / ("zimage" if target == "zimage" else "sd15"))
+    lens_name = f"{concept}_{target}_contrastive"
+    meta_path = out_dir / f"{lens_name}_metadata.json"
+    if meta_path.exists():
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+        meta["training_mode"] = "vl_caption_fewshot"
+        meta["n_positive_images"] = len(pos_images)
+        meta["n_negative_images"] = len(neg_images) if neg_images else 0
+        meta["vl_model"] = vl_model or "auto"
+        meta["training_time_s"] = round(time.time() - t0, 1)
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
+
+    print(f"\n  VL-captioned lens total time: {time.time() - t0:.1f}s")
+    return lens_path
+
+
+def _generate_neutral_captions(positive_captions: list[str]) -> list[str]:
+    """Generate neutral counterpart captions by stripping style descriptors.
+
+    Uses simple text transforms to create 'same scene, neutral style' versions.
+    These aren't perfect but give the contrastive optimizer enough contrast.
+    """
+    import re
+
+    # Style/aesthetic words to strip
+    style_words = {
+        "dramatic", "cinematic", "moody", "ethereal", "dreamy", "stunning",
+        "gorgeous", "breathtaking", "atmospheric", "magical", "mystical",
+        "haunting", "evocative", "striking", "captivating", "luminous",
+        "vibrant", "vivid", "intense", "bold", "rich", "deep", "lush",
+        "delicate", "subtle", "soft", "gentle", "warm", "cool", "golden",
+        "silver", "crimson", "azure", "emerald", "amber", "noir",
+        "chiaroscuro", "bokeh", "lens flare", "rim lighting",
+        "backlit", "silhouette", "high contrast", "low key", "high key",
+        "anamorphic", "shallow depth of field", "tilt-shift",
+        "painterly", "surreal", "otherworldly", "fantastical",
+        "epic", "majestic", "grandiose", "sweeping",
+        "gritty", "raw", "visceral", "brutal",
+        "elegant", "refined", "luxurious", "opulent",
+        "melancholic", "somber", "brooding", "dark",
+        "whimsical", "playful", "cheerful", "joyful",
+    }
+
+    neutral = []
+    for caption in positive_captions:
+        # Remove style adjectives
+        words = caption.split()
+        filtered = [w for w in words if w.lower().strip(".,;:!?")
+                    not in style_words]
+        result = " ".join(filtered)
+
+        # Simplify: prefix with neutral framing
+        result = f"A standard photograph showing {result.lower()}" if result else \
+            "A standard photograph of an everyday scene with normal lighting and composition"
+
+        # Clean up double spaces
+        result = re.sub(r'\s+', ' ', result).strip()
+        neutral.append(result)
+
+    return neutral
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1167,12 +1845,13 @@ def generate_lens_sae(
     sae_epochs: int = 200,
     n_activation_prompts: int = 500,
     top_k: int = 30,
-    refine_dpo: bool = True,
-    dpo_steps: int = 500,
+    refine_contrastive: bool = True,
+    contrastive_steps: int = 500,
     include_bridge: bool = True,
     output_dir: Optional[Path] = None,
     sae_save_path: Optional[Path] = None,
     sae_load_path: Optional[Path] = None,
+    transcoder_repo: Optional[str] = None,
 ) -> Path:
     """Generate a lens using SAE feature decomposition of the residual stream.
 
@@ -1183,7 +1862,7 @@ def generate_lens_sae(
       4. Run contrastive texts through the model + SAE
       5. Find differential features (which SAE features fire for + but not -)
       6. Reconstruct a clean direction from top-K features (bias-free)
-      7. Optionally refine with DPO for robust separation
+      7. Optionally refine with Contrastive for robust separation
       8. Export lens with feature metadata for interpretability
 
     Args:
@@ -1196,8 +1875,8 @@ def generate_lens_sae(
         sae_epochs: SAE training epochs
         n_activation_prompts: number of diverse prompts for activation collection
         top_k: number of SAE features to keep in concept direction
-        refine_dpo: also run DPO on the output embeddings and blend
-        dpo_steps: DPO optimization steps (if refine_dpo)
+        refine_contrastive: also run Contrastive on the output embeddings and blend
+        contrastive_steps: Contrastive optimization steps (if refine_contrastive)
         include_bridge: train SigLIP->Qwen bridge
         output_dir: override output directory
         sae_save_path: save trained SAE to this path for reuse
@@ -1215,9 +1894,15 @@ def generate_lens_sae(
             "SigLIP models are too small for meaningful SAE decomposition."
         )
 
+    # ── Resolve transcoder vs SAE mode ────────────────────────────────
+    use_transcoder = bool(transcoder_repo)
+    mode_label = "Transcoder" if use_transcoder else "SAE"
+
     print(f"\n{'='*60}")
-    print(f"  Lens Factory [SAE]: '{concept}' ({target})")
+    print(f"  Lens Factory [{mode_label}]: '{concept}' ({target})")
     print(f"  {len(positive_texts)} text pairs, top-{top_k} features")
+    if use_transcoder:
+        print(f"  Transcoder repo: {transcoder_repo}")
     print(f"{'='*60}\n")
 
     t0 = time.time()
@@ -1229,61 +1914,80 @@ def generate_lens_sae(
     num_layers = 36
     hidden_dim = QWEN_HIDDEN_DIM
     target_layer = layer if layer is not None else int(num_layers * 0.6)
-    d_sae = hidden_dim * sae_expansion
 
     print(f"  Target layer: {target_layer}/{num_layers}")
-    print(
-        f"  SAE dimensions: {hidden_dim}d → {d_sae}d ({sae_expansion}x expansion)")
 
-    # ── Step 2: Load or train SAE ────────────────────────────────────────
-    cache_key = f"{target_layer}_{sae_expansion}"
+    # ── Step 2: Load transcoder OR load/train SAE ────────────────────────
+    if use_transcoder:
+        # Download and load pretrained transcoder — skip SAE training entirely
+        print(f"\n[2/7] Downloading pretrained transcoder (layer {target_layer})...")
+        tc_path = download_transcoder_layer(
+            layer=target_layer, repo_id=transcoder_repo)
+        print(f"  Loading transcoder from {tc_path}...")
+        sae_model = load_sae_or_transcoder(tc_path, d_model=hidden_dim)
 
-    if sae_load_path and Path(sae_load_path).exists():
-        print(f"\n[2/7] Loading pre-trained SAE from {sae_load_path}...")
-        sae_model = SparseAutoencoder(hidden_dim, d_sae).to(DEVICE)
-        sae_state = torch.load(
-            sae_load_path, map_location=DEVICE, weights_only=True)
-        sae_model.load_state_dict(sae_state)
-        sae_model.eval()
-        print(f"  SAE loaded ({hidden_dim}d → {d_sae}d)")
-    elif cache_key in _sae_cache:
-        print(
-            f"\n[2/7] Using cached SAE (layer {target_layer}, {sae_expansion}x)...")
-        sae_model = _sae_cache[cache_key]
-    else:
-        print(f"\n[2/7] Collecting activations for SAE training...")
-        prompts = generate_diverse_prompts(n_activation_prompts)
-        print(f"  Generated {len(prompts)} diverse prompts")
-
-        all_acts = collect_layer_activations(
-            prompts, model, tokenizer, target_layer, hidden_dim,
-            pool="all", verbose=True,
-        )
-        print(f"  Activation matrix: {all_acts.shape}")
-
-        print(f"\n[3/7] Training Sparse Autoencoder...")
-        sae_model = train_sae(
-            all_acts, d_sae,
-            l1_coeff=1e-2,
-            epochs=sae_epochs,
-            lr=5e-4,
-            batch_size=512,
-            label=f"layer-{target_layer}",
-        )
-
-        # Cache for reuse across concepts in same session
+        # Auto-detect dimensions from loaded model
+        d_sae = sae_model.encoder.weight.shape[0]
+        sae_expansion = d_sae // hidden_dim
+        cache_key = f"{target_layer}_{sae_expansion}_tc"
         _sae_cache[cache_key] = sae_model
 
-        # Free activation memory
-        del all_acts
-        gc.collect()
-        torch.cuda.empty_cache()
+        print(f"  Transcoder: {hidden_dim}d → {d_sae:,}d ({sae_expansion}x expansion)")
+        print(f"  Skipping SAE training — using pretrained features")
 
-        if sae_save_path:
-            sae_save_path = Path(sae_save_path)
-            sae_save_path.parent.mkdir(parents=True, exist_ok=True)
-            torch.save(sae_model.state_dict(), sae_save_path)
-            print(f"  SAE saved to {sae_save_path}")
+    else:
+        d_sae = hidden_dim * sae_expansion
+        print(
+            f"  SAE dimensions: {hidden_dim}d → {d_sae}d ({sae_expansion}x expansion)")
+
+        cache_key = f"{target_layer}_{sae_expansion}"
+
+        if sae_load_path and Path(sae_load_path).exists():
+            print(f"\n[2/7] Loading pre-trained SAE from {sae_load_path}...")
+            sae_model = SparseAutoencoder(hidden_dim, d_sae).to(DEVICE)
+            sae_state = torch.load(
+                sae_load_path, map_location=DEVICE, weights_only=True)
+            sae_model.load_state_dict(sae_state)
+            sae_model.eval()
+            print(f"  SAE loaded ({hidden_dim}d → {d_sae}d)")
+        elif cache_key in _sae_cache:
+            print(
+                f"\n[2/7] Using cached SAE (layer {target_layer}, {sae_expansion}x)...")
+            sae_model = _sae_cache[cache_key]
+        else:
+            print(f"\n[2/7] Collecting activations for SAE training...")
+            prompts = generate_diverse_prompts(n_activation_prompts)
+            print(f"  Generated {len(prompts)} diverse prompts")
+
+            all_acts = collect_layer_activations(
+                prompts, model, tokenizer, target_layer, hidden_dim,
+                pool="all", verbose=True,
+            )
+            print(f"  Activation matrix: {all_acts.shape}")
+
+            print(f"\n[3/7] Training Sparse Autoencoder...")
+            sae_model = train_sae(
+                all_acts, d_sae,
+                l1_coeff=1e-2,
+                epochs=sae_epochs,
+                lr=5e-4,
+                batch_size=512,
+                label=f"layer-{target_layer}",
+            )
+
+            # Cache for reuse across concepts in same session
+            _sae_cache[cache_key] = sae_model
+
+            # Free activation memory
+            del all_acts
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            if sae_save_path:
+                sae_save_path = Path(sae_save_path)
+                sae_save_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save(sae_model.state_dict(), sae_save_path)
+                print(f"  SAE saved to {sae_save_path}")
 
     # ── Step 3: Extract concept features via SAE ─────────────────────────
     step = 4 if cache_key not in _sae_cache or sae_load_path else 3
@@ -1300,28 +2004,28 @@ def generate_lens_sae(
     sae_direction = sae_result["direction"]
     print(f"  SAE concept direction extracted ({top_k} features)")
 
-    # ── Step 4: Optional DPO refinement ──────────────────────────────────
-    dpo_data = {}
-    if refine_dpo:
-        print(f"\n[{step+1}/7] Encoding texts for DPO refinement...")
+    # ── Step 4: Optional Contrastive refinement ──────────────────────────────────
+    contrastive_data = {}
+    if refine_contrastive:
+        print(f"\n[{step+1}/7] Encoding texts for Contrastive refinement...")
         h_pos = encode_texts_qwen(positive_texts)
         h_neg = encode_texts_qwen(negative_texts)
 
-        print(f"[{step+2}/7] Training DPO direction on output embeddings...")
-        dpo = train_dpo_direction(
-            h_pos, h_neg, dim=QWEN_HIDDEN_DIM, steps=dpo_steps)
+        print(f"[{step+2}/7] Training Contrastive direction on output embeddings...")
+        ctr = train_contrastive_direction(
+            h_pos, h_neg, dim=QWEN_HIDDEN_DIM, steps=contrastive_steps)
 
-        dpo_direction = dpo["direction"]
+        contrastive_direction = ctr["direction"]
 
-        # Blend: use SAE direction as the interpretable core, DPO as refinement
+        # Blend: use SAE direction as the interpretable core, Contrastive as refinement
         # Compute cosine similarity between the two
-        cos_sae_dpo = (sae_direction @ dpo_direction).item()
-        print(f"  cos(SAE, DPO) = {cos_sae_dpo:.3f}")
+        cos_sae_contrastive = (sae_direction @ contrastive_direction).item()
+        print(f"  cos(SAE, Contrastive) = {cos_sae_contrastive:.3f}")
 
         # Final direction: normalize the average of both (equal weight)
         # This gives an interpretable direction that also separates well
-        blended = F.normalize(sae_direction + dpo_direction, dim=0)
-        print(f"  Blended SAE+DPO direction")
+        blended = F.normalize(sae_direction + contrastive_direction, dim=0)
+        print(f"  Blended SAE+Contrastive direction")
 
         # Verify blend separates well
         with torch.no_grad():
@@ -1331,13 +2035,13 @@ def generate_lens_sae(
             blend_margin = (pos_scores.mean() - neg_scores.mean()).item()
             print(f"  Blended direction margin: {blend_margin:+.3f}")
 
-        dpo_data = {
-            "dpo_direction": dpo_direction,
-            "dpo_beta": dpo["beta"],
-            "dpo_accuracy": dpo["accuracy"],
-            "dpo_mean_margin": dpo["mean_margin"],
-            "dpo_min_margin": dpo["min_margin"],
-            "cos_sae_dpo": cos_sae_dpo,
+        contrastive_data = {
+            "contrastive_direction": contrastive_direction,
+            "contrastive_beta": ctr["beta"],
+            "contrastive_accuracy": ctr["accuracy"],
+            "contrastive_mean_margin": ctr["mean_margin"],
+            "contrastive_min_margin": ctr["min_margin"],
+            "cos_sae_contrastive": cos_sae_contrastive,
             "blend_margin": blend_margin,
         }
 
@@ -1349,14 +2053,14 @@ def generate_lens_sae(
     bridge_data = {}
     if include_bridge:
         print(
-            f"\n[{step+3 if refine_dpo else step+1}/7] Training SigLIP -> Qwen bridge...")
+            f"\n[{step+3 if refine_contrastive else step+1}/7] Training SigLIP -> Qwen bridge...")
         all_texts = []
         for p, n in zip(positive_texts, negative_texts):
             all_texts.append(p)
             all_texts.append(n)
         sig_embeds = encode_texts_siglip(all_texts)
 
-        if refine_dpo:
+        if refine_contrastive:
             qwen_interleaved = torch.zeros(len(all_texts), QWEN_HIDDEN_DIM)
             qwen_interleaved[0::2] = h_pos
             qwen_interleaved[1::2] = h_neg
@@ -1393,7 +2097,8 @@ def generate_lens_sae(
     out_dir = output_dir or (LENS_DIR / "zimage")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    method_suffix = "sae_dpo" if refine_dpo else "sae"
+    method_base = "transcoder" if use_transcoder else "sae"
+    method_suffix = f"{method_base}_contrastive" if refine_contrastive else method_base
     lens_name = f"{concept}_{target}_{method_suffix}"
     lens_path = out_dir / f"{lens_name}.pt"
 
@@ -1408,8 +2113,12 @@ def generate_lens_sae(
         "cap_embedder_out_dim": 3840,
         "concept": concept,
         "n_training_pairs": len(positive_texts),
-        "training_mode": "sae" if not refine_dpo else "sae_dpo",
-        # SAE metadata (interpretability)
+        "training_mode": (
+            ("transcoder" if use_transcoder else "sae")
+            + ("_contrastive" if refine_contrastive else "")
+        ),
+        "transcoder_repo": transcoder_repo,
+        # SAE/transcoder metadata (interpretability)
         "sae_layer": target_layer,
         "sae_expansion": sae_expansion,
         "sae_d_sae": d_sae,
@@ -1419,7 +2128,7 @@ def generate_lens_sae(
         "sae_direction": sae_result["direction"],
         "sae_raw_direction": sae_result["raw_direction"],
         "cos_raw_sae": sae_result["cos_raw_sae"],
-        **dpo_data,
+        **contrastive_data,
         **bridge_data,
     }
 
@@ -1430,7 +2139,11 @@ def generate_lens_sae(
         "concept": concept,
         "target": target,
         "direction_dim": QWEN_HIDDEN_DIM,
-        "training_mode": "sae" if not refine_dpo else "sae_dpo",
+        "training_mode": (
+            ("transcoder" if use_transcoder else "sae")
+            + ("_contrastive" if refine_contrastive else "")
+        ),
+        "transcoder_repo": transcoder_repo,
         "n_pairs": len(positive_texts),
         "sae_layer": target_layer,
         "sae_expansion": sae_expansion,
@@ -1439,12 +2152,12 @@ def generate_lens_sae(
         "cos_raw_sae": round(sae_result["cos_raw_sae"], 4),
         "training_time_s": round(time.time() - t0, 1),
     }
-    if refine_dpo:
+    if refine_contrastive:
         meta.update({
-            "dpo_beta": dpo_data["dpo_beta"],
-            "dpo_accuracy": dpo_data["dpo_accuracy"],
-            "cos_sae_dpo": round(dpo_data["cos_sae_dpo"], 4),
-            "blend_margin": round(dpo_data["blend_margin"], 4),
+            "contrastive_beta": contrastive_data["contrastive_beta"],
+            "contrastive_accuracy": contrastive_data["contrastive_accuracy"],
+            "cos_sae_contrastive": round(contrastive_data["cos_sae_contrastive"], 4),
+            "blend_margin": round(contrastive_data["blend_margin"], 4),
         })
     meta_path = out_dir / f"{lens_name}_metadata.json"
     with open(meta_path, "w") as f:
@@ -1452,7 +2165,7 @@ def generate_lens_sae(
 
     print(f"\nLens exported: {lens_path}")
     print(f"  Size: {lens_path.stat().st_size / 1e6:.1f} MB")
-    print(f"  Method: SAE{' + DPO' if refine_dpo else ''}")
+    print(f"  Method: {mode_label}{' + Contrastive' if refine_contrastive else ''}")
     print(f"  Features: {top_k} from layer {target_layer}")
     print(f"  Total time: {time.time() - t0:.1f}s")
     return lens_path
@@ -1465,13 +2178,14 @@ def generate_lens_sae_from_preset(
     sae_expansion: int = 8,
     sae_epochs: int = 200,
     top_k: int = 30,
-    refine_dpo: bool = True,
-    dpo_steps: int = 500,
+    refine_contrastive: bool = True,
+    contrastive_steps: int = 500,
     output_dir: Optional[Path] = None,
     sae_save_path: Optional[Path] = None,
     sae_load_path: Optional[Path] = None,
+    transcoder_repo: Optional[str] = None,
 ) -> Path:
-    """Generate an SAE lens from a built-in concept preset."""
+    """Generate an SAE/transcoder lens from a built-in concept preset."""
     if concept not in CONCEPT_PRESETS:
         available = ", ".join(sorted(CONCEPT_PRESETS.keys()))
         raise ValueError(f"Unknown preset '{concept}'. Available: {available}")
@@ -1488,12 +2202,13 @@ def generate_lens_sae_from_preset(
         sae_expansion=sae_expansion,
         sae_epochs=sae_epochs,
         top_k=top_k,
-        refine_dpo=refine_dpo,
-        dpo_steps=dpo_steps,
+        refine_contrastive=refine_contrastive,
+        contrastive_steps=contrastive_steps,
         include_bridge=True,
         output_dir=output_dir,
         sae_save_path=sae_save_path,
         sae_load_path=sae_load_path,
+        transcoder_repo=transcoder_repo,
     )
 
 
@@ -1660,13 +2375,149 @@ CONCEPT_PRESETS = {
             "An underwater photograph of a reef at moderate depth where water has filtered out warm colors, showing mainly blue and grey tones throughout",
         ],
     },
+    # ─── Utility Presets (steer AWAY from these with negative strength) ──────
+    "text_overlay": {
+        "description": "Text, writing, watermarks, captions, and lettering overlaid on images (use negative strength to suppress)",
+        "positive_prompts": [
+            "A landscape photo with a large white watermark reading 'SAMPLE' stamped diagonally across the center of the image in bold sans-serif font",
+            "A portrait with an Instagram-style text overlay at the bottom reading 'Follow for more' in white Helvetica with a drop shadow",
+            "A city skyline photo with a stock photo watermark grid of repeating text covering the entire image in semi-transparent white letters",
+            "A food photo with a recipe title in large decorative script font overlaid at the top, and ingredient list text at the bottom",
+            "A nature scene with a motivational quote in cursive font overlaid in the center: 'Live Laugh Love' with a lens flare behind the text",
+            "A product photo with price tags, sale banners reading '50% OFF', and promotional text scattered across the image in red and yellow",
+            "A meme image with large white Impact font text at the top and bottom with black outlines, taking up a third of the image",
+            "A screenshot of a social media post with username, timestamp, like count, and comment text overlaid on a photo in UI elements",
+            "A photograph with a copyright notice, photographer name, and date stamp in the corner, plus a semi-transparent logo watermark",
+            "A movie poster with the title in large metallic 3D letters, cast names at the top, tagline in italic, and credits block at the bottom",
+        ],
+        "negative_prompts": [
+            "A landscape photograph showing mountains and sky with no overlaid elements, clean unedited image with nothing on top of the photo",
+            "A portrait of a person with a plain background, no text or graphics added, just the raw photograph as captured by the camera",
+            "A city skyline photograph during sunset showing buildings without any overlaid elements, a clean architectural photo",
+            "A food photograph on a wooden table showing a plated meal, shot from above with natural lighting, no text or labels",
+            "A nature scene showing a forest clearing with sunlight filtering through trees, purely photographic with no additions",
+            "A product photograph on a white background showing the item clearly, clean commercial photography with no price tags or banners",
+            "A candid photograph of a cat sitting on a windowsill, natural spontaneous moment without any added borders or text",
+            "A photograph of a park with people walking on paths between trees, a casual snapshot without any interface elements",
+            "A photograph of a sunset over the ocean, untouched raw photo with no stamps, logos, or text of any kind visible",
+            "A movie set photograph showing actors on location during filming, behind-the-scenes photo without any graphic design",
+        ],
+    },
+    "blur_defocus": {
+        "description": "Blurry, out-of-focus, motion-blurred images (use negative strength for sharper output)",
+        "positive_prompts": [
+            "A completely out-of-focus photograph where nothing is sharp, all shapes are soft undefined blobs of color with no discernible edges",
+            "A photo taken with extreme motion blur, the entire scene is smeared horizontally into streaks of color from camera shake during long exposure",
+            "A portrait where the autofocus locked on the background, leaving the subject's face a soft blur while the wall behind is sharp",
+            "An intentionally defocused night scene where city lights have expanded into massive soft circular bokeh discs filling the frame",
+            "A photograph shot through frosted glass, the scene behind is a soft impressionistic blur of shapes and muted colors",
+            "A photo taken from a moving car window, everything outside is motion-blurred into horizontal streaks, nothing is recognizable",
+            "A macro photo where the depth of field is paper-thin, only one millimeter is sharp, the rest dissolves into creamy smooth blur",
+            "A photograph where the lens is smeared with vaseline or a soft-focus filter, everything has a dreamy hazy glow with no sharp details",
+            "A scene photographed during an earthquake, severe camera shake makes every element doubled and tripled in jagged motion blur",
+            "A photo taken while the lens was zooming, creating radial zoom blur emanating from the center, stretching everything outward",
+        ],
+        "negative_prompts": [
+            "A tack-sharp photograph where every detail is crisp, taken on a tripod with precise focus showing fine texture in every element",
+            "A perfectly still photograph of a building showing razor-sharp edges, every brick and window frame rendered with perfect clarity",
+            "A portrait with precise autofocus on the subject's eyes, every eyelash and skin pore visible in sharp detail at full resolution",
+            "A night scene photograph taken on a tripod with long exposure, city lights are pinpoint sharp stars against a detailed skyline",
+            "A photograph taken through clear glass showing a scene with full sharpness and clarity, every object well-defined and detailed",
+            "A parked car photographed with optimal aperture showing every panel reflection and badge detail perfectly sharp and resolved",
+            "A macro photograph with focus stacking showing an insect with every compound eye facet and wing vein in perfect razor-sharp focus",
+            "A landscape photograph taken at optimal aperture showing fine detail from foreground rocks to distant mountains, all perfectly sharp",
+            "A still life photograph on a tripod showing perfect stability, every object edge clean and well-defined without any blur whatsoever",
+            "A photograph taken with optimal shutter speed freezing all motion, a bird in flight with every feather perfectly crisp and defined",
+        ],
+    },
+    "noise_grain": {
+        "description": "Noisy, grainy, low-quality sensor noise (use negative strength for cleaner output)",
+        "positive_prompts": [
+            "A photograph taken at ISO 25600 in near darkness, extreme luminance noise makes the image look like colored sand, detail drowned in static",
+            "A heavily compressed JPEG image of a face showing severe compression artifacts, blockiness, color banding, and mosquito noise around edges",
+            "A phone photo taken in very low light showing aggressive noise reduction smearing combined with remaining chroma noise in purple and green splotches",
+            "A surveillance camera still showing extreme noise, scanlines, and interlacing artifacts, barely recognizable shapes in a sea of grain",
+            "A photo that's been enlarged 400% showing massive pixel noise, interpolation artifacts, and complete loss of fine detail in a blocky mess",
+            "A film photo shot on expired ISO 3200 film showing extreme grain structure the size of golf balls, with color shifts and fogging",
+            "A webcam screenshot at 240p resolution showing extreme compression, noise, and aliasing, every surface shimmering with digital artifacts",
+            "A night photo from a drone camera showing overwhelming sensor noise, hot pixels, and banding artifacts across the dark sky and dim landscape",
+            "A photograph taken through a screen door or mesh adding a moire pattern of interference noise over the entire scene",
+            "A deep crop from a low-resolution image blown up to poster size, every pixel visible as square blocks, absolute minimum quality",
+        ],
+        "negative_prompts": [
+            "A photograph taken at ISO 100 in good light showing perfectly clean shadows, smooth gradients, and zero visible noise or grain",
+            "A high-resolution photograph with perfect compression, smooth tonal transitions, no blocking artifacts, and pristine image quality",
+            "A well-lit phone photograph in daylight showing smooth skin tones, clean colors, and excellent detail without any visible noise",
+            "A high-definition security camera image showing a clear scene with clean edges, good resolution, and no visible noise or artifacts",
+            "A high-resolution photograph viewed at native size showing fine detail, clean textures, and smooth tonal gradations throughout",
+            "A modern digital photograph shot on medium format with extremely clean files, beautiful tonal range, and zero visible grain",
+            "A high-quality video screenshot at 4K resolution showing clean detail, accurate colors, and smooth gradients without artifacts",
+            "A photograph taken by a professional drone in good lighting showing clean landscape detail with smooth skies and sharp ground textures",
+            "A clear photograph taken in normal conditions showing a clean scene without any interference patterns or overlay effects",
+            "A well-exposed photograph at optimal settings showing the full resolution potential of the camera with no visible noise at all",
+        ],
+    },
+    "hands_fingers": {
+        "description": "Malformed hands, extra fingers, fused digits, wrong finger count (use negative strength to reduce hand artifacts)",
+        "positive_prompts": [
+            "A close-up of a hand with six fingers, the extra digit growing between the ring and pinky finger, all fingers slightly fused at the base",
+            "Two hands clasped together where the fingers blend and merge at the joints, creating an ambiguous mass of too many finger-like protrusions",
+            "A person holding a cup where their hand has only three thick fingers and a thumb, the fingers unnaturally short and wide like sausages",
+            "A hand raised in greeting where each finger splits into two at the second knuckle, creating a branching tree-like structure of twelve fingertips",
+            "A pianist's hands on keys where the fingers are different lengths on each hand, some curving impossibly backward, nails facing wrong directions",
+            "Two hands framing a face where the left hand has four fingers and the right has seven, fingers varying wildly in thickness and length",
+            "A hand holding a pen where the thumb emerges from the center of the palm, fingers overlap each other, and the wrist bends at a wrong angle",
+            "Baby hands reaching out where tiny fingers merge together into webbed paddle-like shapes with too many nail beds visible on each hand",
+            "A person making a peace sign but with extra fingers appearing between the V, fingers at inconsistent angles with knuckles in wrong places",
+            "A close-up of interlocked fingers where it's impossible to tell which finger belongs to which hand, digits phasing through each other",
+        ],
+        "negative_prompts": [
+            "A close-up photograph of a real human hand showing five distinct well-formed fingers with correct proportions, joints, and natural skin texture",
+            "Two real hands clasped together in a clear pose where each finger is distinct, correctly jointed, and the grip is anatomically natural",
+            "A person holding a coffee cup with a natural grip showing five normal fingers wrapped around the cup at anatomically correct angles",
+            "A real hand held up showing all five fingers clearly separated with correct lengths, proportions, and natural finger spacing",
+            "A pianist's real hands photographed on a keyboard showing ten natural fingers with correct anatomy, length ratios, and proper positioning",
+            "Two real hands held up side by side showing matching anatomy, five fingers each, symmetrical proportions, natural skin and nail details",
+            "A real hand holding a pen in a natural writing grip, thumb and index finger pinching, three other fingers supporting naturally as expected",
+            "A real baby's hands photographed showing tiny but perfectly formed five fingers on each hand with correct proportions for an infant",
+            "A real person making a peace sign showing exactly two raised fingers and three curled, with correct anatomy and natural hand proportions",
+            "A real photograph of two people holding hands showing correct interlocking finger anatomy, each digit clearly belonging to one person",
+        ],
+    },
+    "ai_artifacts": {
+        "description": "Common AI generation artifacts: plastic skin, symmetry glitches, floating objects (use negative strength to reduce)",
+        "positive_prompts": [
+            "A portrait with unnaturally smooth waxy skin that looks like plastic, zero pores or blemishes, an uncanny-valley perfection with dead eyes",
+            "A symmetrical face where the left and right halves are exact mirrors, including asymmetric elements like hair parting duplicated on both sides",
+            "A room interior where objects float slightly above surfaces, shadows don't match light sources, and reflections show a different scene",
+            "A group photo where one person has three arms, another's ear merges into their hair, and a hand appears disconnected from any body",
+            "A landscape where the horizon line is inconsistent, water flows uphill, and a tree trunk passes through a solid rock seamlessly",
+            "A close-up of teeth that are perfectly identical cloned rectangles, unnaturally white and uniform like a computer-generated dental model",
+            "A portrait where earrings are different on each ear despite meant to be a pair, glasses frames pass through hair, and collar is asymmetric weirdly",
+            "A street scene where text on signs is gibberish letter-like shapes, numbers are scrambled, and a clock shows impossible time with extra hands",
+            "A photograph-like image where fabric patterns tile and repeat in impossibly regular ways, plaid squares are perfectly aligned even around folds",
+            "A pet portrait where the animal has slightly too many legs, its tail splits partway, and the fur texture has unnaturally regular repeating patterns",
+        ],
+        "negative_prompts": [
+            "A real photograph of a person's face showing natural skin texture with visible pores, slight asymmetry, and natural imperfections",
+            "A real photograph of a person's face showing natural asymmetry between the two halves, slightly different eyebrows, natural hairline",
+            "A real photograph of a room interior where all objects rest naturally on surfaces with physically correct shadows and consistent lighting",
+            "A real group photograph of people with correct anatomy, each person with the right number of limbs, all body parts connected naturally",
+            "A real landscape photograph with consistent horizon, water flowing naturally downhill, and trees growing from soil in physically normal ways",
+            "A real photograph smile showing natural teeth with slight variations in size, shape, and color, normal human dental imperfections",
+            "A real portrait photograph showing matching jewelry, glasses sitting naturally on the nose, and clothing fitting in a physically normal way",
+            "A real street photograph showing legible text on signs, readable numbers, and clocks showing normal valid times with standard clock hands",
+            "A real photograph of fabric showing natural drape where patterns distort around folds, stretch at seams, and follow the cloth's 3D shape",
+            "A real photograph of a pet showing correct anatomy, proper number of legs, single tail, and natural fur with realistic variation in texture",
+        ],
+    },
 }
 
 
 def generate_lens_from_preset(
     concept: str,
     target: str = "zimage",
-    dpo_steps: int = 500,
+    contrastive_steps: int = 500,
     output_dir: Optional[Path] = None,
 ) -> Path:
     """Generate a lens from a built-in concept preset."""
@@ -1682,7 +2533,7 @@ def generate_lens_from_preset(
         positive_texts=preset["positive_prompts"],
         negative_texts=preset["negative_prompts"],
         target=target,
-        dpo_steps=dpo_steps,
+        contrastive_steps=contrastive_steps,
         output_dir=output_dir,
     )
 
@@ -1750,17 +2601,17 @@ Examples:
   # List installed lenses
   python lens_factory.py list-lenses
 
-  # Generate ALL presets at once (DPO)
+  # Generate ALL presets at once (Contrastive)
   python lens_factory.py batch-all --target zimage
 
-  # Generate ALL presets with SAE + DPO
+  # Generate ALL presets with SAE + Contrastive
   python lens_factory.py batch-all --target zimage --method sae
 
   # Generate SAE lens from preset
   python lens_factory.py sae cinematic --target zimage --sae-features 30
 
-  # SAE lens without DPO refinement
-  python lens_factory.py sae cinematic --no-refine-dpo
+  # SAE lens without Contrastive refinement
+  python lens_factory.py sae cinematic --no-refine-contrastive
 
   # Reuse a previously trained SAE
   python lens_factory.py sae ethereal --sae-load ./sae_layer22_8x.pt
@@ -1781,19 +2632,19 @@ Environment variables:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # ── auto (from preset, DPO only) ──
+    # ── auto (from preset, Contrastive only) ──
     p_auto = sub.add_parser(
-        "auto", help="Generate lens from built-in concept preset (DPO)")
+        "auto", help="Generate lens from built-in concept preset (Contrastive)")
     p_auto.add_argument(
         "concept", help="Preset name (e.g. cinematic, ethereal, dark_moody)")
     p_auto.add_argument("--target", default="zimage",
                         choices=["zimage", "sd15"])
     p_auto.add_argument("--steps", type=int, default=500,
-                        help="DPO training steps")
+                        help="Contrastive training steps")
     p_auto.add_argument("--output-dir", type=Path,
                         default=None, help="Override output directory")
 
-    # ── sae (from preset, SAE + optional DPO) ──
+    # ── sae (from preset, SAE + optional Contrastive) ──
     p_sae = sub.add_parser(
         "sae", help="Generate lens via SAE feature decomposition (interpretable)")
     p_sae.add_argument(
@@ -1809,14 +2660,18 @@ Environment variables:
                        help="Number of top SAE features to keep (default: 30)")
     p_sae.add_argument("--n-prompts", type=int, default=500,
                        help="Number of diverse prompts for activation collection (default: 500)")
-    p_sae.add_argument("--no-refine-dpo", action="store_true",
-                       help="Skip DPO refinement (SAE-only direction)")
-    p_sae.add_argument("--dpo-steps", type=int, default=500,
-                       help="DPO optimization steps (default: 500)")
+    p_sae.add_argument("--no-refine-contrastive", action="store_true",
+                       help="Skip Contrastive refinement (SAE-only direction)")
+    p_sae.add_argument("--contrastive-steps", type=int, default=500,
+                       help="Contrastive optimization steps (default: 500)")
     p_sae.add_argument("--sae-save", type=Path, default=None,
                        help="Save trained SAE to this path for reuse")
     p_sae.add_argument("--sae-load", type=Path, default=None,
                        help="Load pre-trained SAE instead of training new one")
+    p_sae.add_argument("--transcoder-repo", type=str, default=None,
+                       help="HuggingFace repo for pretrained transcoders "
+                            "(e.g. 'mwhanna/qwen3-4b-transcoders'). "
+                            "Uses 64x expansion instead of training small SAE.")
     p_sae.add_argument("--output-dir", type=Path, default=None)
 
     # ── text-pairs ──
@@ -1840,6 +2695,13 @@ Environment variables:
                        help="Directory of negative images")
     p_img.add_argument("--concept", required=True, help="Concept name")
     p_img.add_argument("--target", default="sd15", choices=["zimage", "sd15"])
+    p_img.add_argument("--method", default="contrastive",
+                       choices=["contrastive", "vl_caption", "centroid"],
+                       help="Training method (default: contrastive)")
+    p_img.add_argument("--contrastive-steps", type=int, default=500,
+                       help="Contrastive optimization steps (default: 500)")
+    p_img.add_argument("--vl-model", default=None,
+                       help="VL model for captioning (vl_caption mode, auto-detect if empty)")
     p_img.add_argument("--output-dir", type=Path, default=None)
 
     # ── list-presets ──
@@ -1853,8 +2715,8 @@ Environment variables:
         "batch-all", help="Generate lenses for ALL presets")
     p_batch.add_argument("--target", default="zimage",
                          choices=["zimage", "sd15"])
-    p_batch.add_argument("--method", default="dpo", choices=["dpo", "sae"],
-                         help="Training method: 'dpo' (fast) or 'sae' (interpretable, default: dpo)")
+    p_batch.add_argument("--method", default="contrastive", choices=["contrastive", "sae"],
+                         help="Training method: 'contrastive' (fast) or 'sae' (interpretable, default: contrastive)")
     p_batch.add_argument("--steps", type=int, default=500)
     p_batch.add_argument("--sae-features", type=int, default=30,
                          help="Top SAE features to keep (sae method only)")
@@ -1862,6 +2724,8 @@ Environment variables:
                          help="Save trained SAE for reuse (sae method only)")
     p_batch.add_argument("--sae-load", type=Path, default=None,
                          help="Load pre-trained SAE (sae method only)")
+    p_batch.add_argument("--transcoder-repo", type=str, default=None,
+                         help="HuggingFace repo for pretrained transcoders")
     p_batch.add_argument("--output-dir", type=Path, default=None)
 
     args = parser.parse_args()
@@ -1882,7 +2746,7 @@ Environment variables:
     if args.command == "auto":
         generate_lens_from_preset(
             args.concept, target=args.target,
-            dpo_steps=args.steps, output_dir=args.output_dir,
+            contrastive_steps=args.steps, output_dir=args.output_dir,
         )
 
     elif args.command == "sae":
@@ -1893,11 +2757,12 @@ Environment variables:
             sae_expansion=args.sae_expansion,
             sae_epochs=args.sae_epochs,
             top_k=args.sae_features,
-            refine_dpo=not args.no_refine_dpo,
-            dpo_steps=args.dpo_steps,
+            refine_contrastive=not args.no_refine_contrastive,
+            contrastive_steps=args.contrastive_steps,
             output_dir=args.output_dir,
             sae_save_path=args.sae_save,
             sae_load_path=args.sae_load,
+            transcoder_repo=getattr(args, "transcoder_repo", None),
         )
 
     elif args.command == "text-pairs":
@@ -1909,7 +2774,7 @@ Environment variables:
         negative_texts = [d[neg_key] for d in data]
         generate_lens_from_text_pairs(
             args.concept, positive_texts, negative_texts,
-            target=args.target, dpo_steps=args.steps,
+            target=args.target, contrastive_steps=args.steps,
             output_dir=args.output_dir,
         )
 
@@ -1917,6 +2782,10 @@ Environment variables:
         generate_lens_from_images(
             args.concept, args.positive_dir,
             negative_dir=args.negative_dir, target=args.target,
+            use_contrastive=(args.method in ("contrastive", "vl_caption")),
+            contrastive_steps=args.contrastive_steps,
+            use_vl_captions=(args.method == "vl_caption"),
+            vl_model=args.vl_model,
             output_dir=args.output_dir,
         )
 
@@ -1929,16 +2798,17 @@ Environment variables:
                     path = generate_lens_sae_from_preset(
                         concept, target=args.target,
                         top_k=args.sae_features,
-                        refine_dpo=True,
-                        dpo_steps=args.steps,
+                        refine_contrastive=True,
+                        contrastive_steps=args.steps,
                         output_dir=args.output_dir,
                         sae_save_path=args.sae_save,
                         sae_load_path=args.sae_load,
+                        transcoder_repo=getattr(args, "transcoder_repo", None),
                     )
                 else:
                     path = generate_lens_from_preset(
                         concept, target=args.target,
-                        dpo_steps=args.steps, output_dir=args.output_dir,
+                        contrastive_steps=args.steps, output_dir=args.output_dir,
                     )
                 results.append((concept, "OK", str(path)))
             except Exception as e:
