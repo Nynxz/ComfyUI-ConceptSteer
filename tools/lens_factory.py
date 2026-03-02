@@ -235,32 +235,70 @@ def train_sae(
     batch_size: int = 512,
     label: str = "sae",
     verbose: bool = True,
+    resample_dead_every: int = 0,
 ) -> SparseAutoencoder:
     """Train a Sparse Autoencoder on activation data.
 
     Applies:
+      - LR linear warmup over first 5% of steps (prevents early divergence)
       - L1 warmup over first 20% of training (prevents premature feature death)
+      - Gradient clipping (max_norm=1.0) for stability
       - Unit-norm decoder columns after each step (prevents L1 cheating)
-      - Cosine LR schedule
+      - Cosine LR schedule (after warmup)
+      - Optional dead feature resampling (Anthropic-style)
+
+    Dead feature resampling (when resample_dead_every > 0):
+      Features that never fire across a diagnostic batch are "dead weight".
+      Resampling reinitializes their encoder/decoder weights from high-loss
+      data points, giving them a chance to learn something useful. This is
+      critical for large-data training where L1 can kill features early.
+
+      Resampling is calibrated: encoder rows are scaled to match the average
+      norm of *living* encoder rows, and optimizer momentum is properly reset
+      for resampled features.
 
     Args:
         data: (N, d_input) activation vectors
         d_sae: SAE hidden dimension (8x expansion recommended)
         l1_coeff: sparsity penalty strength
         epochs: training epochs
-        lr: learning rate
+        lr: peak learning rate (reached after warmup)
         batch_size: training batch size
         label: display label for progress logging
         verbose: print training progress
+        resample_dead_every: resample dead features every N epochs (0 = disabled).
+            Recommended: every 2 epochs for large datasets (5-10 epochs total),
+            every 25 epochs for small datasets (100+ epochs).
 
     Returns:
         Trained SparseAutoencoder in eval mode
     """
     d_input = data.shape[1]
+    n_vectors = data.shape[0]
+    steps_per_epoch = n_vectors // batch_size
+    total_steps = steps_per_epoch * epochs
+
+    # Dead feature resampling is disabled by default. It requires careful
+    # calibration of encoder scaling relative to activation norms, and naive
+    # resampling reliably causes divergence when activation norms are large
+    # (e.g. norm ~150 for Qwen). Users can opt in via resample_dead_every > 0
+    # in the node UI if they want to experiment.
+    if resample_dead_every > 0 and verbose:
+        print(f"  Dead feature resampling enabled every {resample_dead_every} epoch(s)")
+    elif verbose:
+        print(f"  Dead feature resampling: disabled (default)")
+
+    # Warmup steps: 5% of total, minimum 50 steps
+    warmup_steps = max(50, int(total_steps * 0.05))
 
     if verbose:
+        act_norm = data.norm(dim=-1).mean().item()
         print(
-            f"  Training SAE: {d_input}d → {d_sae}d ({data.shape[0]:,} vectors, {epochs} epochs)")
+            f"  Training SAE: {d_input}d → {d_sae}d "
+            f"({n_vectors:,} vectors, {epochs} epochs, batch={batch_size})"
+        )
+        print(f"  Total steps: ~{total_steps:,} ({steps_per_epoch:,}/epoch)")
+        print(f"  Activation norm: {act_norm:.1f}, LR warmup: {warmup_steps} steps")
 
     # Exit inference_mode — ComfyUI wraps node execution in inference_mode()
     # which is stricter than no_grad and cannot be overridden by enable_grad().
@@ -270,9 +308,17 @@ def train_sae(
         data = data.detach().clone()
 
         sae = SparseAutoencoder(d_input, d_sae, l1_coeff).to(DEVICE)
-        opt = torch.optim.Adam(sae.parameters(), lr=lr)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=epochs, eta_min=lr * 0.1)
+        opt = torch.optim.Adam(sae.parameters(), lr=lr, betas=(0.9, 0.999))
+
+        # Combined LR schedule: linear warmup then cosine decay
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return step / warmup_steps  # linear warmup from 0 → 1
+            # Cosine decay from 1 → 0.1 over remaining steps
+            progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+            return 0.1 + 0.9 * 0.5 * (1 + np.cos(np.pi * progress))
+
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
         loader = torch.utils.data.DataLoader(
             torch.utils.data.TensorDataset(data),
@@ -280,19 +326,32 @@ def train_sae(
             shuffle=True,
             drop_last=True,
         )
+
+        # Determine how often to log (every ~20% of training, at least every epoch)
+        log_every = max(1, epochs // 5)
+
+        t_start = time.time()
+        global_step = 0
+
         for epoch in range(1, epochs + 1):
             total_mse = total_l1 = 0
-            l1_scale = min(1.0, epoch / (epochs * 0.2)
-                           )  # warmup over first 20%
+            l1_scale = min(1.0, epoch / (epochs * 0.2))  # L1 warmup over first 20%
 
             for (batch,) in loader:
                 batch = batch.to(DEVICE)
                 x_hat, z = sae(batch)
                 mse = (x_hat - batch).pow(2).mean()
                 l1 = z.abs().mean() * l1_coeff * l1_scale
-                (mse + l1).backward()
+                loss = mse + l1
+                loss.backward()
+
+                # Gradient clipping — critical for stability with large activations
+                torch.nn.utils.clip_grad_norm_(sae.parameters(), max_norm=1.0)
+
                 opt.step()
                 opt.zero_grad()
+                sched.step()
+                global_step += 1
 
                 # Enforce unit-norm decoder columns
                 with torch.no_grad():
@@ -303,20 +362,128 @@ def train_sae(
                 total_mse += mse.item()
                 total_l1 += l1.item()
 
-            sched.step()
+            # ── Dead feature resampling ──
+            # Only resample if:
+            #  - resample_dead_every > 0
+            #  - we're on a resampling epoch
+            #  - we're past epoch 2 (let training stabilize)
+            #  - we have ≥3 epochs remaining (resampled features need time)
+            #  - we're in the first 60% of training
+            remaining_epochs = epochs - epoch
+            can_resample = (
+                resample_dead_every > 0
+                and epoch % resample_dead_every == 0
+                and epoch >= 3
+                and remaining_epochs >= 3
+                and epoch <= int(epochs * 0.6)
+            )
+            if can_resample:
+                with torch.no_grad():
+                    # Check which features are dead on a large sample
+                    check_size = min(10_000, n_vectors)
+                    z_check = sae.encode(data[:check_size].to(DEVICE))
+                    dead_mask = z_check.sum(0) == 0  # (d_sae,)
+                    n_dead = dead_mask.sum().item()
+                    alive_mask = ~dead_mask
 
-            if verbose and (epoch == 1 or epoch % 25 == 0 or epoch == epochs):
+                    # Cap resampling at 10% of features per round to avoid
+                    # destabilizing the model
+                    max_resample = int(d_sae * 0.10)
+                    if n_dead > max_resample:
+                        dead_indices_all = dead_mask.nonzero().squeeze(-1)
+                        perm = torch.randperm(n_dead)[:max_resample]
+                        # Only resample a subset
+                        resample_indices = dead_indices_all[perm]
+                        n_resample = max_resample
+                    else:
+                        resample_indices = dead_mask.nonzero().squeeze(-1)
+                        n_resample = n_dead
+
+                    if n_resample > 0 and alive_mask.any():
+                        # Find high-loss data points to seed dead features
+                        x_sample = data[:check_size].to(DEVICE)
+                        x_hat_sample = sae.decoder(z_check)
+                        losses = (x_sample - x_hat_sample).pow(2).sum(dim=-1)
+                        # Sample data points proportional to their loss
+                        probs = losses / losses.sum()
+                        seed_indices = torch.multinomial(
+                            probs, n_resample, replacement=True
+                        )
+
+                        # Reinitialize dead decoder columns from high-loss points
+                        new_dirs = F.normalize(x_sample[seed_indices], dim=-1)
+                        sae.decoder.weight.data[:, resample_indices] = new_dirs.T
+
+                        # CRITICAL: Set encoder rows to a TINY fraction of living
+                        # norms. With activation norms of ~150, full-norm encoder
+                        # rows produce activations in the hundreds, which
+                        # immediately destabilizes training. Starting at 1% lets
+                        # training gradually scale them up.
+                        alive_enc_norms = sae.encoder.weight.data[alive_mask].norm(
+                            dim=1
+                        )
+                        target_enc_norm = alive_enc_norms.median().item() * 0.01
+                        sae.encoder.weight.data[resample_indices] = (
+                            new_dirs * target_enc_norm
+                        )
+
+                        # Set encoder bias negative enough that resampled features
+                        # don't fire immediately. They need a strong match to
+                        # activate, and training will adjust the bias upward
+                        # for useful features.
+                        sae.encoder.bias.data[resample_indices] = -1.0
+
+                        # Reset optimizer momentum for resampled features so
+                        # Adam doesn't apply stale statistics
+                        for param in sae.parameters():
+                            if param not in opt.state:
+                                continue
+                            state = opt.state[param]
+                            for key in ["exp_avg", "exp_avg_sq"]:
+                                if key not in state:
+                                    continue
+                                s = state[key]
+                                if param is sae.encoder.weight or param is sae.decoder.weight:
+                                    if param is sae.encoder.weight:
+                                        s[resample_indices] = 0
+                                    else:
+                                        s[:, resample_indices] = 0
+                                elif param is sae.encoder.bias:
+                                    s[resample_indices] = 0
+
+                        if verbose:
+                            print(
+                                f"    [{label}] Resampled {n_resample} dead features "
+                                f"(of {n_dead} dead) at epoch {epoch} "
+                                f"(enc_norm={target_enc_norm:.2f})"
+                            )
+
+            # ── Logging ──
+            should_log = (
+                epoch == 1
+                or epoch % log_every == 0
+                or epoch == epochs
+            )
+            if verbose and should_log:
                 n = len(loader)
                 with torch.no_grad():
-                    z_check = sae.encode(data[:2000].to(DEVICE))
+                    check_size = min(5_000, n_vectors)
+                    z_check = sae.encode(data[:check_size].to(DEVICE))
                     l0 = (z_check > 0).float().sum(1).mean()
                     dead = (z_check.sum(0) == 0).sum()
                     cos_sim = F.cosine_similarity(
-                        data[:2000].to(DEVICE), sae.decoder(z_check)
+                        data[:check_size].to(DEVICE), sae.decoder(z_check)
                     ).mean()
+
+                current_lr = sched.get_last_lr()[0]
+                elapsed = time.time() - t_start
+                eta = elapsed / epoch * (epochs - epoch) if epoch > 0 else 0
                 print(
-                    f"    [{label}] {epoch:>3d}/{epochs}: mse={total_mse/n:.6f} "
-                    f"l1={total_l1/n:.6f} L0={l0:.0f}/{d_sae} dead={dead} cos={cos_sim:.4f}"
+                    f"    [{label}] {epoch:>3d}/{epochs}: "
+                    f"mse={total_mse/n:.4f} l1={total_l1/n:.6f} "
+                    f"L0={l0:.0f}/{d_sae} dead={dead} cos={cos_sim:.4f} "
+                    f"lr={current_lr:.2e} "
+                    f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)"
                 )
 
     return sae.eval()
@@ -407,7 +574,8 @@ def download_transcoder_feature_dict(
     try:
         from huggingface_hub import hf_hub_download
     except ImportError:
-        raise RuntimeError("huggingface_hub required for feature dictionary download")
+        raise RuntimeError(
+            "huggingface_hub required for feature dictionary download")
 
     # Download index (~24 MB compressed)
     if not index_local.exists():
@@ -427,7 +595,8 @@ def download_transcoder_feature_dict(
 
     # Download layer bin (~1 GB)
     if not bin_local.exists():
-        print(f"  Downloading feature dictionary for layer {layer} (~1 GB, only needed once)...")
+        print(
+            f"  Downloading feature dictionary for layer {layer} (~1 GB, only needed once)...")
         dl = hf_hub_download(
             repo_id=repo_id,
             filename=f"features/layer_{layer}.bin",
@@ -560,10 +729,11 @@ def load_sae_or_transcoder(
     # ── Load weights ──
     if path.suffix == ".safetensors":
         from safetensors import safe_open
-        sf = safe_open(str(path), framework="pt", device=str(DEVICE))
+        # Load to CPU first to avoid 2x GPU peak during copy
+        sf = safe_open(str(path), framework="pt", device="cpu")
         state = {k: sf.get_tensor(k) for k in sf.keys()}
     else:
-        state = torch.load(str(path), map_location=DEVICE, weights_only=True)
+        state = torch.load(str(path), map_location="cpu", weights_only=True)
 
     # ── Detect format ──
     keys = set(state.keys())
@@ -571,9 +741,9 @@ def load_sae_or_transcoder(
     # Format 1: Our native SparseAutoencoder (nn.Linear keys)
     if "encoder.weight" in keys:
         d_sae, d_in = state["encoder.weight"].shape
-        sae = SparseAutoencoder(d_in, d_sae).to(DEVICE)
+        sae = SparseAutoencoder(d_in, d_sae)
         sae.load_state_dict(state)
-        sae.eval()
+        sae = sae.to(DEVICE).eval()
         expansion = d_sae // d_in
         print(f"  Loaded native SAE: {d_in}d → {d_sae}d ({expansion}x)")
         return sae
@@ -581,7 +751,8 @@ def load_sae_or_transcoder(
     # Format 2: Transcoder format (W_enc, W_dec, etc.)
     if "W_enc" in keys:
         W_enc = state["W_enc"]  # [d_feature, d_model]
-        W_dec = state["W_dec"]  # [d_feature, d_model] (already transposed in repo)
+        # [d_feature, d_model] (already transposed in repo)
+        W_dec = state["W_dec"]
         b_enc = state.get("b_enc")  # [d_feature] — may not exist
         b_dec = state.get("b_dec")  # [d_model] — may not exist
 
@@ -592,14 +763,15 @@ def load_sae_or_transcoder(
               f"{d_feature:,} features)")
 
         if d_in != d_model:
-            print(f"  WARNING: transcoder d_model={d_in} != expected {d_model}")
+            print(
+                f"  WARNING: transcoder d_model={d_in} != expected {d_model}")
 
         if expected_expansion and expansion != expected_expansion:
             print(f"  NOTE: expansion {expansion}x != expected {expected_expansion}x "
                   f"(auto-adjusting)")
 
-        # Wrap in our SparseAutoencoder interface
-        sae = SparseAutoencoder(d_in, d_feature, l1_coeff=0).to(DEVICE)
+        # Wrap in our SparseAutoencoder interface (build on CPU, move once)
+        sae = SparseAutoencoder(d_in, d_feature, l1_coeff=0)
 
         with torch.no_grad():
             # encoder: nn.Linear weight is [out, in], matches W_enc [d_feature, d_model]
@@ -612,12 +784,21 @@ def load_sae_or_transcoder(
             # decoder: nn.Linear weight is [out, in] = [d_model, d_feature]
             # W_dec from transcoder is [d_feature, d_model], so transpose it
             sae.decoder.weight.copy_(W_dec.T)
-            if b_dec is not None:
-                sae.decoder.bias.copy_(b_dec)
-            else:
-                sae.decoder.bias.zero_()
 
-        sae.eval()
+            # IMPORTANT: Zero decoder bias for transcoders.
+            # Our SparseAutoencoder.encode() pre-centers with (x - decoder.bias),
+            # which is an Anthropic SAE convention. Transcoders have independent
+            # b_dec that should NOT be used for pre-centering. Zeroing it makes
+            # encode() = ReLU(W_enc @ x + b_enc), which is correct for transcoders.
+            # decode_sparse() already ignores bias, so this doesn't affect direction
+            # extraction.
+            sae.decoder.bias.zero_()
+
+        # Free CPU state dict before moving to GPU
+        del state, W_enc, W_dec, b_enc, b_dec
+        gc.collect()
+
+        sae = sae.to(DEVICE).eval()
         return sae
 
     raise ValueError(
@@ -742,6 +923,213 @@ def collect_layer_activations(
     return result
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+#  HuggingFace Dataset Activation Collection (for proper SAE training)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Recommended target sizes by expansion factor:
+#   8×  (20K features)  → 500K–1M vectors
+#   16× (40K features)  → 1M–2M vectors
+#   64× (160K features) → 2M–5M vectors
+# Rule of thumb: ~25–50 vectors per feature minimum.
+
+DEFAULT_HF_DATASET = "HuggingFaceFW/fineweb"
+DEFAULT_HF_SUBSET = "sample-10BT"  # 10B token sample — plenty for streaming
+
+
+def collect_activations_from_dataset(
+    model,
+    tokenizer,
+    layer_idx: int,
+    hidden_dim: int,
+    n_vectors: int = 500_000,
+    dataset_name: str = DEFAULT_HF_DATASET,
+    dataset_subset: str = DEFAULT_HF_SUBSET,
+    text_column: str = "text",
+    max_length: int = 128,
+    batch_size: int = 16,
+    seed: int = 42,
+    verbose: bool = True,
+    save_path: Optional[str] = None,
+) -> torch.Tensor:
+    """Stream real text from a HuggingFace dataset and collect layer activations.
+
+    Uses streaming mode so no full dataset download is needed. Collects
+    activations from all token positions (not just mean-pooled) to maximize
+    data diversity per text sample.
+
+    For SAE training, you want 25–50× more activation vectors than SAE features.
+    With 8× expansion on 2560d (= 20,480 features), target ~500K–1M vectors.
+
+    Args:
+        model: Qwen3Model (or similar) with .layers attribute
+        tokenizer: corresponding tokenizer
+        layer_idx: which transformer layer to hook
+        hidden_dim: model hidden dimension
+        n_vectors: target number of activation vectors to collect
+        dataset_name: HuggingFace dataset identifier
+        dataset_subset: dataset config/subset name
+        text_column: column name containing text
+        max_length: max tokens per text (longer = more vectors per sample)
+        batch_size: texts per forward pass (adjust for GPU memory)
+        seed: random seed for dataset shuffling
+        verbose: print progress
+        save_path: if set, save activations to disk (for reuse without re-collecting)
+
+    Returns:
+        Tensor of shape (N, hidden_dim) where N >= n_vectors
+    """
+    from datasets import load_dataset
+
+    if verbose:
+        print(f"  Streaming activations from {dataset_name}/{dataset_subset}")
+        print(f"  Target: {n_vectors:,} vectors from layer {layer_idx}")
+
+    # Check for cached activations
+    if save_path and os.path.isfile(save_path):
+        if verbose:
+            print(f"  Loading cached activations from {save_path}")
+        cached = torch.load(save_path, map_location="cpu", weights_only=True)
+        if cached.shape[0] >= n_vectors and cached.shape[1] == hidden_dim:
+            if verbose:
+                print(f"  Cached: {cached.shape} — sufficient, skipping collection")
+            return cached[:n_vectors]
+        else:
+            if verbose:
+                print(f"  Cached {cached.shape} insufficient (need {n_vectors}), re-collecting")
+
+    # Load dataset in streaming mode — no full download
+    ds = load_dataset(
+        dataset_name,
+        dataset_subset,
+        split="train",
+        streaming=True,
+    )
+    ds = ds.shuffle(seed=seed, buffer_size=10_000)
+
+    collected: list[torch.Tensor] = []
+    total_vectors = 0
+    total_texts = 0
+    skipped = 0
+    t0 = time.time()
+
+    # Temporary buffer for hook outputs (cleared after each batch)
+    _hook_buf: list[torch.Tensor] = []
+
+    def _hook(module, input, output):
+        h = output[0] if isinstance(output, tuple) else output
+        _hook_buf.append(h.detach().cpu().float())
+
+    handle = model.layers[layer_idx].register_forward_hook(_hook)
+
+    try:
+        batch_texts: list[str] = []
+
+        for sample in ds:
+            text = sample.get(text_column, "")
+            if not text or len(text.strip()) < 20:
+                skipped += 1
+                continue
+
+            # Truncate very long texts to save memory (still get max_length tokens)
+            if len(text) > max_length * 8:
+                text = text[:max_length * 8]
+
+            batch_texts.append(text)
+
+            if len(batch_texts) >= batch_size:
+                # Tokenize and forward the batch
+                inputs = tokenizer(
+                    batch_texts,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=max_length,
+                    padding=True,
+                )
+                inputs = {k: v.to(DEVICE) for k, v in inputs.items()}
+
+                _hook_buf.clear()
+                with torch.no_grad():
+                    model(
+                        input_ids=inputs["input_ids"],
+                        attention_mask=inputs["attention_mask"],
+                    )
+
+                # Hook produces one tensor of shape (B, T, D) per forward pass.
+                # Apply attention mask to exclude padding token activations.
+                if _hook_buf:
+                    act = _hook_buf[0]  # (B, T, D)
+                    mask = inputs["attention_mask"].cpu()  # (B, T)
+                    if act.dim() == 3:
+                        for i in range(act.shape[0]):
+                            valid = mask[i].bool()
+                            collected.append(act[i, valid])  # (n_valid, D)
+                    else:
+                        # Unexpected shape — just reshape and keep
+                        collected.append(act.reshape(-1, hidden_dim))
+
+                total_texts += len(batch_texts)
+                total_vectors = sum(a.shape[0] for a in collected)
+                batch_texts = []
+
+                if verbose and total_texts % (batch_size * 10) == 0:
+                    elapsed = time.time() - t0
+                    rate = total_vectors / elapsed if elapsed > 0 else 0
+                    print(
+                        f"    {total_texts:,} texts → {total_vectors:,} vectors "
+                        f"({total_vectors/n_vectors:.0%} of target, "
+                        f"{rate:,.0f} vec/s)"
+                    )
+
+                if total_vectors >= n_vectors:
+                    break
+
+                # Periodic memory management — consolidate collected tensors
+                if len(collected) > 500:
+                    valid = [
+                        a.reshape(-1, hidden_dim)
+                        for a in collected
+                        if a.dim() >= 1 and a.shape[-1] == hidden_dim
+                    ]
+                    collected = [torch.cat(valid)] if valid else []
+                    gc.collect()
+
+    finally:
+        handle.remove()
+
+    # Consolidate all activations
+    valid = [
+        a.reshape(-1, hidden_dim)
+        for a in collected
+        if a.dim() >= 1 and a.shape[-1] == hidden_dim
+    ]
+    if not valid:
+        raise RuntimeError(
+            f"No activations collected after {total_texts} texts. "
+            f"Check layer_idx={layer_idx} and model architecture."
+        )
+
+    result = torch.cat(valid)[:n_vectors]
+
+    elapsed = time.time() - t0
+    if verbose:
+        print(
+            f"  Collected: {result.shape} in {elapsed:.1f}s "
+            f"(norm={result.norm(dim=-1).mean():.2f}, skipped={skipped})"
+        )
+
+    # Optionally cache to disk
+    if save_path:
+        save_dir = Path(save_path).parent
+        save_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(result, save_path)
+        mb = Path(save_path).stat().st_size / 1024 / 1024
+        if verbose:
+            print(f"  Saved activations: {save_path} ({mb:.1f} MB)")
+
+    return result
+
+
 def extract_concept_features(
     positive_texts: list[str],
     negative_texts: list[str],
@@ -785,29 +1173,106 @@ def extract_concept_features(
     if verbose:
         print(f"  Extracting concept features (top-{top_k} from SAE)...")
 
-    # 1. Collect layer activations (mean-pooled per text)
-    pos_acts = collect_layer_activations(
-        positive_texts, model, tokenizer, layer_idx, hidden_dim,
-        pool="mean", verbose=False,
-    )
-    neg_acts = collect_layer_activations(
-        negative_texts, model, tokenizer, layer_idx, hidden_dim,
-        pool="mean", verbose=False,
-    )
-
-    # Raw direction (for magnitude reference)
-    raw_dir = pos_acts.mean(0) - neg_acts.mean(0)
-
-    # 2. Encode through SAE
+    d_sae = sae_model.d_sae
     _dev = next(sae_model.parameters()).device
-    with torch.no_grad():
-        pos_feats = sae_model.encode(pos_acts.to(_dev)).cpu()
-        neg_feats = sae_model.encode(neg_acts.to(_dev)).cpu()
+    is_large = d_sae > 40_000  # transcoder-scale
 
-    # 3. Differential features
-    diff = pos_feats.mean(0) - neg_feats.mean(0)
+    if is_large:
+        # ── Per-token encoding for transcoders ──────────────────────────
+        # Transcoders were trained on individual token activations.
+        # Mean-pooling before ReLU kills the signal:
+        #   ReLU(W_enc @ mean(tokens)) ≠ mean(ReLU(W_enc @ token_i))
+        # So we encode each token separately, then mean-pool the features.
+        if verbose:
+            print(f"    Using per-token encoding ({d_sae:,} features)")
 
-    # 4. Top-K by absolute magnitude
+        def _encode_texts_per_token(texts):
+            """Collect per-token activations and encode through SAE, one text at a time."""
+            feat_accum = torch.zeros(d_sae)
+            n_tokens = 0
+            raw_accum = torch.zeros(hidden_dim)
+
+            for text in texts:
+                # Collect all token activations for this single text
+                acts = collect_layer_activations(
+                    [text], model, tokenizer, layer_idx, hidden_dim,
+                    pool="all", verbose=False,
+                )  # [T, hidden_dim]
+
+                raw_accum += acts.sum(0)
+                n_tokens += acts.shape[0]
+
+                # Encode through SAE per-token (batch it)
+                with torch.no_grad():
+                    feats = sae_model.encode(acts.to(_dev)).cpu()  # [T, d_sae]
+                feat_accum += feats.sum(0)
+
+            # Mean across all tokens
+            mean_feats = feat_accum / max(n_tokens, 1)
+            mean_raw = raw_accum / max(n_tokens, 1)
+            return mean_feats, mean_raw, n_tokens
+
+        pos_mean_feats, pos_mean_raw, n_pos = _encode_texts_per_token(positive_texts)
+        neg_mean_feats, neg_mean_raw, n_neg = _encode_texts_per_token(negative_texts)
+
+        raw_dir = pos_mean_raw - neg_mean_raw
+        diff = pos_mean_feats - neg_mean_feats
+
+        if verbose:
+            print(f"    Encoded {n_pos} positive tokens, {n_neg} negative tokens")
+
+    else:
+        # ── Mean-pooled encoding for native SAEs ────────────────────────
+        # Our trained SAEs are fitted to mean-pooled data, so this is correct.
+        pos_acts = collect_layer_activations(
+            positive_texts, model, tokenizer, layer_idx, hidden_dim,
+            pool="mean", verbose=False,
+        )
+        neg_acts = collect_layer_activations(
+            negative_texts, model, tokenizer, layer_idx, hidden_dim,
+            pool="mean", verbose=False,
+        )
+
+        raw_dir = pos_acts.mean(0) - neg_acts.mean(0)
+
+        with torch.no_grad():
+            pos_feats = sae_model.encode(pos_acts.to(_dev)).cpu()
+            neg_feats = sae_model.encode(neg_acts.to(_dev)).cpu()
+
+        diff = pos_feats.mean(0) - neg_feats.mean(0)
+
+    # Count how many features have meaningful differential activation
+    n_nonzero = (diff.abs() > 1e-6).sum().item()
+    if verbose:
+        print(f"    Differential features with non-zero activation: "
+              f"{n_nonzero:,} / {diff.shape[0]:,}")
+        if n_nonzero > 0:
+            nonzero_diffs = diff[diff.abs() > 1e-6]
+            print(f"    Differential range: [{nonzero_diffs.min():.4f}, "
+                  f"{nonzero_diffs.max():.4f}], "
+                  f"mean abs: {nonzero_diffs.abs().mean():.4f}")
+
+    # 4. Auto-scale top_k for large feature spaces
+    #    At 8x expansion (20K features), top-30 = 0.15% coverage.
+    #    Scale proportionally for larger expansions to maintain coverage.
+    d_sae = diff.shape[0]
+    if d_sae > 40_000 and top_k <= 50:
+        # Auto-scale: maintain ~0.15% coverage
+        scaled_k = max(top_k, min(int(d_sae * 0.0015), 200))
+        if scaled_k != top_k and verbose:
+            print(f"    Auto-scaling top_k: {top_k} → {scaled_k} "
+                  f"(0.15% of {d_sae:,} features)")
+        top_k = scaled_k
+
+    # Also cap at actual non-zero features
+    if n_nonzero < top_k:
+        effective_k = max(n_nonzero, 2)  # At least 2 features
+        if verbose and effective_k != top_k:
+            print(f"    Capping top_k to {effective_k} "
+                  f"(only {n_nonzero} features have differential activation)")
+        top_k = effective_k
+
+    # Select top-K by absolute magnitude
     top_idx = torch.argsort(-diff.abs())[:top_k]
     sparse = torch.zeros_like(diff)
     sparse[top_idx] = diff[top_idx]
@@ -1325,6 +1790,7 @@ def generate_lens_from_images(
     use_vl_captions: bool = False,
     vl_model: Optional[str] = None,
     output_dir: Optional[Path] = None,
+    transcoder_repo: Optional[str] = None,
 ) -> Path:
     """Generate a lens from few-shot example images.
 
@@ -1387,6 +1853,7 @@ def generate_lens_from_images(
             vl_model=vl_model,
             output_dir=output_dir,
             t0=t0,
+            transcoder_repo=transcoder_repo,
         )
 
     # ── SigLIP embedding path ────────────────────────────────────────────
@@ -1716,6 +2183,7 @@ def _generate_lens_vl_caption(
     vl_model: Optional[str],
     output_dir: Optional[Path],
     t0: float,
+    transcoder_repo: Optional[str] = None,
 ) -> Path:
     """Few-shot via VL captioning → contrastive training in native text-encoder space.
 
@@ -1728,7 +2196,7 @@ def _generate_lens_vl_caption(
     then generates "neutral" counterparts by re-captioning with style stripped.
     """
     print(f"[2/4] Loading VL model for captioning...")
-    _, _, caption_fn = _load_vl_model(vl_model)
+    vl_model_obj, vl_processor, caption_fn = _load_vl_model(vl_model)
 
     print(f"\n[3/4] Captioning {len(pos_images)} positive images...")
     pos_captions = caption_fn(pos_images)
@@ -1746,33 +2214,69 @@ def _generate_lens_vl_caption(
         print("  Generating neutral counterpart captions...")
         neg_captions = _generate_neutral_captions(pos_captions)
 
+    # Free VL model VRAM before loading transcoder/encoder
+    del caption_fn, vl_processor
+    if vl_model_obj is not None:
+        del vl_model_obj
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("  VL model unloaded — VRAM freed")
+
     print(f"\n  Positive captions: {len(pos_captions)}")
     print(f"  Negative captions: {len(neg_captions)}")
 
-    # Now run standard text-pair contrastive training
-    print(f"\n[4/4] Training contrastive direction from VL captions...")
-    lens_path = generate_lens_from_text_pairs(
-        concept=concept,
-        positive_texts=pos_captions,
-        negative_texts=neg_captions,
-        target=target,
-        include_bridge=(target == "zimage"),
-        output_dir=output_dir,
-        contrastive_steps=contrastive_steps,
-    )
+    # ── Route through transcoder or pure contrastive ─────────────────────
+    if transcoder_repo and target == "zimage":
+        # Strongest path: VL captions → transcoder feature decomposition
+        print(f"\n[4/4] Training lens via transcoder decomposition from VL captions...")
+        print(f"  Transcoder: {transcoder_repo}")
+        lens_path = generate_lens_sae(
+            concept=concept,
+            positive_texts=pos_captions,
+            negative_texts=neg_captions,
+            target=target,
+            include_bridge=True,
+            output_dir=output_dir,
+            contrastive_steps=contrastive_steps,
+            transcoder_repo=transcoder_repo,
+        )
+    else:
+        # Standard text-pair contrastive training
+        if transcoder_repo and target != "zimage":
+            print(f"  NOTE: transcoder only supported for zimage target, "
+                  f"falling back to contrastive for {target}")
+        print(f"\n[4/4] Training contrastive direction from VL captions...")
+        lens_path = generate_lens_from_text_pairs(
+            concept=concept,
+            positive_texts=pos_captions,
+            negative_texts=neg_captions,
+            target=target,
+            include_bridge=(target == "zimage"),
+            output_dir=output_dir,
+            contrastive_steps=contrastive_steps,
+        )
 
     # Re-save metadata to note this was VL-captioned
     out_dir = output_dir or (
         LENS_DIR / ("zimage" if target == "zimage" else "sd15"))
-    lens_name = f"{concept}_{target}_contrastive"
+    # Determine lens filename based on training mode
+    if transcoder_repo and target == "zimage":
+        method_suffix = "transcoder_contrastive"
+    else:
+        method_suffix = "contrastive"
+    lens_name = f"{concept}_{target}_{method_suffix}"
     meta_path = out_dir / f"{lens_name}_metadata.json"
     if meta_path.exists():
         with open(meta_path, "r") as f:
             meta = json.load(f)
-        meta["training_mode"] = "vl_caption_fewshot"
+        meta["training_mode"] = (
+            "vl_caption_transcoder_fewshot" if transcoder_repo and target == "zimage"
+            else "vl_caption_fewshot"
+        )
         meta["n_positive_images"] = len(pos_images)
         meta["n_negative_images"] = len(neg_images) if neg_images else 0
         meta["vl_model"] = vl_model or "auto"
+        meta["transcoder_repo"] = transcoder_repo
         meta["training_time_s"] = round(time.time() - t0, 1)
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
@@ -1920,7 +2424,8 @@ def generate_lens_sae(
     # ── Step 2: Load transcoder OR load/train SAE ────────────────────────
     if use_transcoder:
         # Download and load pretrained transcoder — skip SAE training entirely
-        print(f"\n[2/7] Downloading pretrained transcoder (layer {target_layer})...")
+        print(
+            f"\n[2/7] Downloading pretrained transcoder (layer {target_layer})...")
         tc_path = download_transcoder_layer(
             layer=target_layer, repo_id=transcoder_repo)
         print(f"  Loading transcoder from {tc_path}...")
@@ -1932,7 +2437,8 @@ def generate_lens_sae(
         cache_key = f"{target_layer}_{sae_expansion}_tc"
         _sae_cache[cache_key] = sae_model
 
-        print(f"  Transcoder: {hidden_dim}d → {d_sae:,}d ({sae_expansion}x expansion)")
+        print(
+            f"  Transcoder: {hidden_dim}d → {d_sae:,}d ({sae_expansion}x expansion)")
         print(f"  Skipping SAE training — using pretrained features")
 
     else:
@@ -2017,15 +2523,31 @@ def generate_lens_sae(
 
         contrastive_direction = ctr["direction"]
 
-        # Blend: use SAE direction as the interpretable core, Contrastive as refinement
-        # Compute cosine similarity between the two
+        # ── Adaptive blending based on agreement ─────────────────────────
+        # When SAE/transcoder and contrastive agree (high cos), blend equally.
+        # When they disagree (low cos), lean on contrastive which has proven
+        # separation (100% accuracy, high margin). Don't dilute a good
+        # contrastive direction with a noisy/orthogonal SAE direction.
         cos_sae_contrastive = (sae_direction @ contrastive_direction).item()
         print(f"  cos(SAE, Contrastive) = {cos_sae_contrastive:.3f}")
 
-        # Final direction: normalize the average of both (equal weight)
-        # This gives an interpretable direction that also separates well
-        blended = F.normalize(sae_direction + contrastive_direction, dim=0)
-        print(f"  Blended SAE+Contrastive direction")
+        # Adaptive weight: sae_weight ranges from 0.0 (orthogonal) to 0.5 (aligned)
+        # Linear ramp: weight = max(0, cos) clamped to [0, 0.5]
+        # cos ≥ 0.5 → equal blend; cos ≈ 0 → pure contrastive; cos < 0 → pure contrastive
+        sae_weight = max(0.0, min(cos_sae_contrastive, 0.5))
+        ctr_weight = 1.0 - sae_weight
+
+        if sae_weight < 0.05:
+            # SAE direction is orthogonal/opposed — use pure contrastive
+            blended = contrastive_direction.clone()
+            print(f"  SAE direction orthogonal — using pure contrastive")
+        else:
+            blended = F.normalize(
+                sae_weight * sae_direction + ctr_weight * contrastive_direction,
+                dim=0,
+            )
+            print(f"  Blended: SAE weight={sae_weight:.2f}, "
+                  f"Contrastive weight={ctr_weight:.2f}")
 
         # Verify blend separates well
         with torch.no_grad():
@@ -2043,6 +2565,8 @@ def generate_lens_sae(
             "contrastive_min_margin": ctr["min_margin"],
             "cos_sae_contrastive": cos_sae_contrastive,
             "blend_margin": blend_margin,
+            "blend_sae_weight": sae_weight,
+            "blend_ctr_weight": ctr_weight,
         }
 
         final_direction = blended
@@ -2122,7 +2646,7 @@ def generate_lens_sae(
         "sae_layer": target_layer,
         "sae_expansion": sae_expansion,
         "sae_d_sae": d_sae,
-        "sae_top_k": top_k,
+        "sae_top_k": sae_result["top_k"],
         "sae_feature_indices": sae_result["feature_indices"],
         "sae_feature_weights": sae_result["feature_weights"],
         "sae_direction": sae_result["direction"],
@@ -2147,8 +2671,7 @@ def generate_lens_sae(
         "n_pairs": len(positive_texts),
         "sae_layer": target_layer,
         "sae_expansion": sae_expansion,
-        "sae_top_k": top_k,
-        "sae_features": [int(i) for i in sae_result["feature_indices"].tolist()],
+        "sae_top_k": sae_result["top_k"],        "sae_features": [int(i) for i in sae_result["feature_indices"].tolist()],
         "cos_raw_sae": round(sae_result["cos_raw_sae"], 4),
         "training_time_s": round(time.time() - t0, 1),
     }
@@ -2165,8 +2688,9 @@ def generate_lens_sae(
 
     print(f"\nLens exported: {lens_path}")
     print(f"  Size: {lens_path.stat().st_size / 1e6:.1f} MB")
-    print(f"  Method: {mode_label}{' + Contrastive' if refine_contrastive else ''}")
-    print(f"  Features: {top_k} from layer {target_layer}")
+    print(
+        f"  Method: {mode_label}{' + Contrastive' if refine_contrastive else ''}")
+    print(f"  Features: {sae_result['top_k']} from layer {target_layer}")
     print(f"  Total time: {time.time() - t0:.1f}s")
     return lens_path
 
@@ -2702,6 +3226,9 @@ Environment variables:
                        help="Contrastive optimization steps (default: 500)")
     p_img.add_argument("--vl-model", default=None,
                        help="VL model for captioning (vl_caption mode, auto-detect if empty)")
+    p_img.add_argument("--transcoder-repo", type=str, default=None,
+                       help="HuggingFace repo for pretrained transcoders "
+                            "(used with vl_caption mode for feature decomposition)")
     p_img.add_argument("--output-dir", type=Path, default=None)
 
     # ── list-presets ──
@@ -2787,6 +3314,7 @@ Environment variables:
             use_vl_captions=(args.method == "vl_caption"),
             vl_model=args.vl_model,
             output_dir=args.output_dir,
+            transcoder_repo=getattr(args, "transcoder_repo", None),
         )
 
     elif args.command == "batch-all":

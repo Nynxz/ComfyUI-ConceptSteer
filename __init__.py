@@ -24,6 +24,12 @@ Nodes:
     - Feature Dictionary: Build a lookup of what each SAE feature responds to
     - Feature Map: Visualize SAE feature activations in conditioning
     - Feature Gate: Suppress or amplify individual SAE features
+    - Feature Probe: Inject a single feature direction to see what it does
+
+  Research / Mechanistic Interpretability:
+    - Diff Features: Compare two conditionings to discover differential features
+    - Feature Atlas: Build a persistent catalog + SAE health diagnostics
+    - Feature Dashboard: Browse and explore the feature atlas visually
 """
 
 from comfy_api.latest import ComfyExtension, io
@@ -39,6 +45,9 @@ from .nodes.ConceptFeatureGate import ConceptFeatureGateNode
 from .nodes.ConceptFeatureProbe import ConceptFeatureProbeNode
 from .nodes.ConceptTrainSAEOnly import ConceptTrainSAEOnlyNode
 from .nodes.ConceptFeatureDict import ConceptFeatureDictNode
+from .nodes.ConceptDiffFeatures import ConceptDiffFeaturesNode
+from .nodes.ConceptFeatureAtlas import ConceptFeatureAtlasNode
+from .nodes.ConceptFeatureDashboard import ConceptFeatureDashboardNode
 
 
 class ConceptSteerExtension(ComfyExtension):
@@ -60,6 +69,10 @@ class ConceptSteerExtension(ComfyExtension):
             ConceptFeatureMapNode,
             ConceptFeatureGateNode,
             ConceptFeatureProbeNode,
+            # Research / Mechanistic Interpretability
+            ConceptDiffFeaturesNode,
+            ConceptFeatureAtlasNode,
+            ConceptFeatureDashboardNode,
         ]
 
 

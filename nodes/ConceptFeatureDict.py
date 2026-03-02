@@ -178,12 +178,14 @@ class ConceptFeatureDictNode(io.ComfyNode):
             prompts.extend(generate_extra_prompts(n_extra_prompts))
         _log(f"Probing with {len(prompts)} prompts...")
 
-        # ── Collect layer activations for all prompts ──
-        collected = []
+        # ── Collect per-token layer activations for all prompts ──
+        # We collect per-token vectors (matching SAE training) then aggregate
+        # to per-prompt max activations for labeling.
+        prompt_token_acts: list[torch.Tensor] = []  # list of [n_tokens, hidden_dim]
 
         def _hook(module, input, output):
             h = output[0] if isinstance(output, tuple) else output
-            collected.append(h.detach().cpu().float())
+            prompt_token_acts.append(h.detach().cpu().float())
 
         handle = model.layers[layer].register_forward_hook(_hook)
 
@@ -193,21 +195,33 @@ class ConceptFeatureDictNode(io.ComfyNode):
             ).to(DEVICE)
             with torch.no_grad():
                 model(inputs.input_ids, attention_mask=inputs.attention_mask)
+            # Keep only non-padding tokens
+            if prompt_token_acts:
+                act = prompt_token_acts[-1]  # [1, seq_len, hidden]
+                mask = inputs.attention_mask.cpu()  # [1, seq_len]
+                prompt_token_acts[-1] = act[0, mask[0].bool()]  # [n_valid, hidden]
             if (i + 1) % 50 == 0:
                 _log(f"  {i+1}/{len(prompts)} prompts encoded")
 
         handle.remove()
 
-        # Mean-pool each prompt's hidden states → [n_prompts, hidden_dim]
-        prompt_acts = torch.stack([c.squeeze(0).mean(0) for c in collected])
-        del collected
-
-        # ── Encode through SAE ──
+        # ── Encode per-token through SAE, aggregate to per-prompt ──
         _log("Encoding through SAE...")
         sae_dev = next(sae.parameters()).device
+
+        # For each prompt: encode its tokens → take max activation per feature
+        # This answers "did ANY token in this prompt strongly activate feature F?"
+        prompt_max_acts = []  # [n_prompts, d_sae]
         with torch.no_grad():
-            all_features = sae.encode(prompt_acts.to(sae_dev)).cpu()
-            # [n_prompts, d_sae]
+            for token_acts in prompt_token_acts:
+                z = sae.encode(token_acts.to(sae_dev))  # [n_tokens, d_sae]
+                max_per_feat = z.max(dim=0).values  # [d_sae] — max across tokens
+                prompt_max_acts.append(max_per_feat.cpu())
+
+        all_features = torch.stack(prompt_max_acts)  # [n_prompts, d_sae]
+        n_total_tokens = sum(t.shape[0] for t in prompt_token_acts)
+        del prompt_token_acts
+        _log(f"  {n_total_tokens:,} tokens from {len(prompts)} prompts")
 
         # ── Build dictionary: for each feature, find top-activating prompts ──
         _log("Building feature dictionary...")
@@ -253,9 +267,16 @@ class ConceptFeatureDictNode(io.ComfyNode):
             mean_act = feat_acts[feat_acts > 0].mean(
             ).item() if firing_rate > 0 else 0
 
-            # Selectivity: std/mean ratio — higher = more discriminative
-            selectivity = (feat_std[0, local_idx] / feat_mean[0, local_idx]).item() \
-                if feat_mean[0, local_idx].item() > 0 else 0.0
+            # Selectivity: high when feature fires strongly on few prompts
+            # but weakly/not-at-all on most. Penalize features that fire on
+            # <1% or >80% of prompts — too rare = noise, too common = useless.
+            if 0.005 < firing_rate < 0.8 and feat_mean[0, local_idx].item() > 0:
+                selectivity = (feat_std[0, local_idx] / feat_mean[0, local_idx]).item()
+                # Bonus for features in the sweet spot (2-30% firing)
+                if 0.02 <= firing_rate <= 0.3:
+                    selectivity *= 1.5
+            else:
+                selectivity = 0.0  # don't label noise or always-on features
 
             raw_entries[str(feat_idx)] = {
                 "top_list": top_list,

@@ -123,6 +123,17 @@ class ConceptTrainFewShotNode(io.ComfyNode):
                     ),
                 ),
                 io.String.Input(
+                    "transcoder_repo",
+                    default="",
+                    tooltip=(
+                        "HuggingFace repo for pretrained transcoders "
+                        "(e.g. 'mwhanna/qwen3-4b-transcoders'). "
+                        "When set with VL caption mode, captions are decomposed through "
+                        "163,840 monosemantic transcoder features for much better concept "
+                        "isolation. Only supported for zimage target."
+                    ),
+                ),
+                io.String.Input(
                     "output_dir",
                     default="",
                     tooltip="Override output directory for the lens file",
@@ -144,6 +155,7 @@ class ConceptTrainFewShotNode(io.ComfyNode):
         contrastive_steps: int = 500,
         vl_model: str = "",
         encoder_path: str = "",
+        transcoder_repo: str = "",
         output_dir: str = "",
     ):
         # ── Validate inputs ──
@@ -195,6 +207,7 @@ class ConceptTrainFewShotNode(io.ComfyNode):
                 use_vl_captions=(method == "vl_caption"),
                 vl_model=vl_model.strip() or None,
                 output_dir=out,
+                transcoder_repo=transcoder_repo.strip() or None,
             )
             elapsed = time.time() - t0
             _log(f"Few-shot lens trained in {elapsed:.1f}s → {lens_path}")

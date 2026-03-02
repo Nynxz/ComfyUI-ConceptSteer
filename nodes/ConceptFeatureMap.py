@@ -23,6 +23,7 @@ meaning of features transfers well.
 import os
 import sys
 import torch
+import torch.nn.functional as F
 import numpy as np
 from io import BytesIO
 from pathlib import Path
@@ -240,13 +241,13 @@ class ConceptFeatureMapNode(io.ComfyNode):
                 ),
                 io.Combo.Input(
                     "pool_mode",
-                    default="mean",
-                    options=["mean", "max", "per_token"],
+                    default="per_token",
+                    options=["per_token", "mean", "max"],
                     tooltip=(
-                        "How to pool token activations: "
-                        "'mean' = average across tokens, "
-                        "'max' = max activation per feature across tokens, "
-                        "'per_token' = show per-token heatmap"
+                        "How to handle token activations before SAE encoding. "
+                        "'per_token' = encode each token individually (matches SAE training), "
+                        "'mean' = average tokens then encode (fast but less accurate), "
+                        "'max' = max activation per feature across tokens"
                     ),
                 ),
                 io.String.Input(
@@ -432,6 +433,35 @@ class ConceptFeatureMapNode(io.ComfyNode):
                 lines.append(f"F{idx:>6d}  {val:>10.4f}  {label}")
             else:
                 lines.append(f"F{idx:>6d}  {val:>10.4f}")
+
+        # ── SAE reconstruction sanity check (use per-token vectors to match training) ──
+        with torch.no_grad():
+            # Always test on per-token activations for accurate quality metric
+            test_in = c.reshape(-1, cond_dim)  # [B*tokens, D]
+            # Sample up to 500 tokens to keep it fast
+            if test_in.shape[0] > 500:
+                test_in = test_in[:500]
+            test_recon, _ = sae(test_in.to(sae_device))
+            sanity_cos = F.cosine_similarity(
+                test_in.to(sae_device), test_recon, dim=-1
+            ).mean().item()
+            sanity_mse = (
+                test_in.to(sae_device) - test_recon
+            ).pow(2).mean().item()
+
+        if sanity_cos > 0.95:
+            quality_note = "✓ Faithful — features are reliable"
+        elif sanity_cos > 0.85:
+            quality_note = "⚠ Approximate — features are directionally correct but lossy"
+        else:
+            quality_note = "✗ Poor — SAE may need retraining, features are unreliable"
+
+        lines.extend([
+            "",
+            "── SAE Reconstruction Quality ──",
+            f"Cosine similarity: {sanity_cos:.4f}  {quality_note}",
+            f"MSE: {sanity_mse:.6f}",
+        ])
 
         # Suppression helper
         lines.extend([
