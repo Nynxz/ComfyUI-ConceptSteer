@@ -9,6 +9,10 @@ Nodes:
   Steering:
     - Concept Steer: Apply a concept lens to CLIP/text-encoder conditioning
 
+  Advanced Steering:
+    - Timestep Steer: σ-dependent steering via model forward-pass hooks
+    - Layer Steer: Per-layer steering via cross-attention output hooks
+
   Training:
     - Train Lens (Contrastive): Train a concept lens from text pairs via contrastive optimization
     - Train Lens (SAE): Train a concept lens via SAE feature decomposition
@@ -34,6 +38,8 @@ Nodes:
 
 from comfy_api.latest import ComfyExtension, io
 from .nodes.ConceptSteer import ConceptSteerNode
+from .nodes.ConceptTimestepSteer import ConceptTimestepSteerNode
+from .nodes.ConceptLayerSteer import ConceptLayerSteerNode
 from .nodes.ConceptTrainContrastive import ConceptTrainContrastiveNode
 from .nodes.ConceptTrainSAE import ConceptTrainSAENode
 from .nodes.ConceptTrainFewShot import ConceptTrainFewShotNode
@@ -55,6 +61,9 @@ class ConceptSteerExtension(ComfyExtension):
         return [
             # Steering
             ConceptSteerNode,
+            # Advanced Steering
+            ConceptTimestepSteerNode,
+            ConceptLayerSteerNode,
             # Training
             ConceptTrainContrastiveNode,
             ConceptTrainSAENode,
