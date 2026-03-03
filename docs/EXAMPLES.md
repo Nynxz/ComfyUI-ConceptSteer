@@ -1,8 +1,8 @@
 # Concept Steer — Training Examples
 
-Copy-paste ready text pairs for DPO and SAE training. Each concept has 10 matched pairs: positive texts embody the concept, negative texts describe the same scene without the aesthetic quality.
+Copy-paste ready text pairs for Contrastive and SAE training. Each concept has 10 matched pairs: positive texts embody the concept, negative texts describe the same scene without the aesthetic quality.
 
-Paste the **Positive** block into the "positive_texts" input and the **Negative** block into the "negative_texts" input of the Train Lens (DPO) or Train Lens (SAE) nodes.
+Paste the **Positive** block into the "positive_texts" input and the **Negative** block into the "negative_texts" input of the Train Lens (Contrastive) or Train Lens (SAE) nodes.
 
 For CLI usage, save pairs as a JSON file (see [JSON Format](#json-format) at the bottom).
 
@@ -372,7 +372,7 @@ python tools/lens_factory.py text-pairs my_pairs.json --concept my_concept --tar
 # Set encoder path first
 export QWEN_ENCODER_PATH="/path/to/qwen_3_4b.safetensors"
 
-# ── DPO Training (fast, ~2-5 min) ──────────────────────────
+# ── Contrastive Training (fast, ~2-5 min) ──────────────────────────
 
 # Train from a preset
 python tools/lens_factory.py auto cinematic --target zimage
@@ -394,8 +394,8 @@ python tools/lens_factory.py batch-all --target zimage --method sae --sae-save .
 # SAE with pre-trained SAE (much faster for 2nd+ concept)
 python tools/lens_factory.py sae ethereal --sae-load ./my_sae.pt
 
-# SAE without DPO refinement
-python tools/lens_factory.py sae dark_moody --no-refine-dpo
+# SAE without contrastive refinement
+python tools/lens_factory.py sae dark_moody --no-refine-contrastive
 
 # ── Few-Shot (from images) ─────────────────────────────────
 

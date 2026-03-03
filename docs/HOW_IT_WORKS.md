@@ -8,7 +8,7 @@
 
 1. [The Core Idea](#the-core-idea)
 2. [Why It Works](#why-it-works)
-3. [How Lenses Are Trained — DPO](#how-lenses-are-trained)
+3. [How Lenses Are Trained — Contrastive](#how-lenses-are-trained)
 4. [How Lenses Are Trained — SAE](#sae-mode)
 5. [The Cross-Modal Bridge](#the-cross-modal-bridge)
 6. [How Lenses Steer Generation](#how-lenses-steer-generation)
@@ -55,20 +55,20 @@ The diffusion model's conditioning mechanism is additive by design. The text emb
 
 ### The Norm Trick
 
-We normalize the lens direction relative to the average token norm in the conditioning tensor. This means `strength=1.0` adds a perturbation roughly equal in magnitude to a typical token embedding. This makes the strength parameter intuitive and consistent across different prompts:
+We normalize the lens direction relative to the average token norm in the conditioning tensor, scaled down by 0.3× so that the perturbation doesn't overwhelm the signal. Without this scaling, `strength=1.0` would add a vector with the full average token norm to every token position — far too aggressive. With it, `strength=1.0` adds ~30% of a typical token norm, which produces a clearly visible but non-destructive effect:
 
-- `strength=0.3` → subtle influence
+- `strength=0.5` → subtle influence
 - `strength=1.0` → clearly present
-- `strength=2.0` → dominant
+- `strength=3.0` → dominant
 - `strength=-1.0` → steer **away** from the concept
 
 ---
 
 ## How Lenses Are Trained
 
-### DPO (Direct Preference Optimization) Direction Training
+### Contrastive (Paired Margin Optimization) Direction Training
 
-We adapt DPO — originally a reinforcement learning technique for LLM alignment — to find concept directions. Instead of training a policy, we train a **direction vector**:
+We adapt Contrastive — originally a reinforcement learning technique for LLM alignment — to find concept directions. Instead of training a policy, we train a **direction vector**:
 
 **Input:** N text pairs. Each pair has a "positive" text (embodies the concept) and a "negative" text (neutral/opposite).
 
@@ -83,7 +83,7 @@ We adapt DPO — originally a reinforcement learning technique for LLM alignment
 3. Initialize random unit direction `d` (2560-dim)
 4. For each optimization step:
    - Compute margins: `margin_i = (h_positive_i · d) - (h_negative_i · d)`
-   - DPO loss: `L = -mean(log(σ(β × margins)))`
+   - contrastive loss: `L = -mean(log(σ(β × margins)))`
    - Update `d` via Adam optimizer
    - Re-normalize `d` to unit length
 5. Sweep β ∈ {0.1, 0.3, 0.5, 1.0, 2.0} and select the β that maximizes the minimum margin (most robust separation)
@@ -97,9 +97,9 @@ We adapt DPO — originally a reinforcement learning technique for LLM alignment
 
 Typical results: 100% accuracy (all positive texts score higher than their negative counterpart), minimum margins of +15 to +24.
 
-### Why DPO Over Simpler Methods?
+### Why Contrastive Over Simpler Methods?
 
-We could compute `d = mean(positive) - mean(negative)` (centroid difference). This works but is fragile — outliers can skew the direction, and it doesn't guarantee that every pair is correctly separated. DPO explicitly optimizes for **worst-case separation**, yielding more robust directions.
+We could compute `d = mean(positive) - mean(negative)` (centroid difference). This works but is fragile — outliers can skew the direction, and it doesn't guarantee that every pair is correctly separated. Contrastive explicitly optimizes for **worst-case separation**, yielding more robust directions.
 
 ---
 
@@ -107,9 +107,9 @@ We could compute `d = mean(positive) - mean(negative)` (centroid difference). Th
 
 ### Sparse Autoencoder Feature Decomposition
 
-The SAE mode goes deeper than DPO. Instead of operating only on the text encoder's **output** embeddings, it hooks into the **residual stream** — the intermediate hidden states flowing through the transformer layers — and decomposes them into interpretable features using a Sparse Autoencoder.
+The SAE mode goes deeper than Contrastive. Instead of operating only on the text encoder's **output** embeddings, it hooks into the **residual stream** — the intermediate hidden states flowing through the transformer layers — and decomposes them into interpretable features using a Sparse Autoencoder.
 
-**Why this matters:** DPO gives you a direction that separates concepts, but you can't inspect *what* it learned. SAE gives you a direction built from specific, identifiable features — you know exactly which sparse features fire for "cinematic" and by how much.
+**Why this matters:** Contrastive gives you a direction that separates concepts, but you can't inspect *what* it learned. SAE gives you a direction built from specific, identifiable features — you know exactly which sparse features fire for "cinematic" and by how much.
 
 ### Architecture
 
@@ -150,10 +150,10 @@ Sparse Autoencoder (SAE)
    - decode_sparse() → bias-free direction in activation space
    - Scale to match raw activation magnitude
 
-5. OPTIONAL DPO REFINEMENT: Run DPO on output embeddings, blend
+5. OPTIONAL Contrastive REFINEMENT: Run Contrastive on output embeddings, blend
    - SAE direction: interpretable, decomposed into known features
-   - DPO direction: optimized for robust separation
-   - Blend: normalize(SAE + DPO) → best of both worlds
+   - contrastive direction: optimized for robust separation
+   - Blend: normalize(SAE + Contrastive) → best of both worlds
 ```
 
 ### What Layer 22 Captures
@@ -169,22 +169,22 @@ Each lens trained with SAE mode includes metadata showing which features it uses
   "sae_top_k": 30,
   "sae_features": [4821, 12033, 7944, 18201, ...],
   "cos_raw_sae": 0.847,
-  "cos_sae_dpo": 0.912
+  "cos_sae_contrastive": 0.912
 }
 ```
 
 - `sae_features`: The specific SAE feature indices that define this concept
 - `cos_raw_sae`: How well the SAE direction matches raw centroid difference (>0.8 = good)
-- `cos_sae_dpo`: Alignment between SAE and DPO directions (>0.7 = good agreement)
+- `cos_sae_contrastive`: Alignment between SAE and contrastive directions (>0.7 = good agreement)
 
-### SAE vs DPO: When to Use Which
+### SAE vs Contrastive: When to Use Which
 
-| Criterion | DPO | SAE | SAE + DPO |
+| Criterion | Contrastive | SAE | SAE + Contrastive |
 |---|---|---|---|
 | Speed | Fast (~30s) | Slow (~5min) | Slowest (~6min) |
 | Interpretability | Opaque | Full feature list | Features + robust separation |
 | Robustness | High | Moderate | Highest |
-| Feature reuse | No | SAE cached across concepts | SAE cached + DPO |
+| Feature reuse | No | SAE cached across concepts | SAE cached + Contrastive |
 | Best for | Quick lenses | Research, debugging | Production quality |
 
 ### Reusing a Trained SAE
@@ -235,7 +235,7 @@ Temperature τ = 0.07 makes the loss sensitive to fine-grained alignment.
 
 ### Why This Matters
 
-With the bridge trained, a lens direction found via DPO in Qwen space can be verified in SigLIP space (and vice versa). Image embeddings from SigLIP can be projected into Qwen space to create lenses from visual examples, not just text.
+With the bridge trained, a lens direction found via Contrastive in Qwen space can be verified in SigLIP space (and vice versa). Image embeddings from SigLIP can be projected into Qwen space to create lenses from visual examples, not just text.
 
 ---
 
@@ -314,16 +314,16 @@ Key insight: Z Image's `cap_embedder` is a **linear** layer (2560 → 3840, no a
 
 A lens is a `.pt` file (PyTorch serialized dict) containing:
 
-### Z Image DPO Lens (Primary Format)
+### Z Image Contrastive Lens (Primary Format)
 
 ```python
 {
     "direction": Tensor(2560),        # The concept direction (unit vector)
     "direction_dim": 2560,
-    "dpo_beta": 0.5,                  # DPO temperature used
-    "dpo_accuracy": 1.0,              # Classification accuracy on training pairs
-    "dpo_mean_margin": 17.77,         # Average margin (higher = better separation)
-    "dpo_min_margin": 15.08,          # Worst-case margin
+    "contrastive_beta": 0.5,                  # Contrastive temperature used
+    "contrastive_accuracy": 1.0,              # Classification accuracy on training pairs
+    "contrastive_mean_margin": 17.77,         # Average margin (higher = better separation)
+    "contrastive_min_margin": 15.08,          # Worst-case margin
     "encoder_name": "qwen_3_4b",
     "encoder_hidden_dim": 2560,
     "encoder_type": "Qwen3Model",
@@ -341,13 +341,13 @@ A lens is a `.pt` file (PyTorch serialized dict) containing:
 }
 ```
 
-### SAE + DPO Lens
+### SAE + Contrastive Lens
 
 ```python
 {
-    "direction": Tensor(2560),        # Blended SAE+DPO direction
+    "direction": Tensor(2560),        # Blended SAE+Contrastive direction
     "direction_dim": 2560,
-    "training_mode": "sae_dpo",
+    "training_mode": "sae_contrastive",
     "concept": "cinematic",
 
     # SAE metadata (interpretability)
@@ -360,14 +360,14 @@ A lens is a `.pt` file (PyTorch serialized dict) containing:
     "sae_direction": Tensor(2560),     # Pure SAE direction (pre-blend)
     "cos_raw_sae": 0.847,             # SAE vs raw centroid alignment
 
-    # DPO refinement
-    "dpo_direction": Tensor(2560),     # Pure DPO direction (pre-blend)
-    "dpo_beta": 0.5,
-    "dpo_accuracy": 1.0,
-    "cos_sae_dpo": 0.912,             # SAE vs DPO alignment
+    # contrastive refinement
+    "contrastive_direction": Tensor(2560),     # Pure contrastive direction (pre-blend)
+    "contrastive_beta": 0.5,
+    "contrastive_accuracy": 1.0,
+    "cos_sae_contrastive": 0.912,             # SAE vs Contrastive alignment
     "blend_margin": 18.5,             # Blended direction's separation margin
 
-    # Cross-modal bridge (same as DPO lens)
+    # Cross-modal bridge (same as contrastive lens)
     "proj_sig2qwen_state": dict,
     ...
 }
@@ -404,7 +404,7 @@ Each lens has a companion `*_metadata.json` with human-readable training stats.
 
 ### 1. Text Pairs (Most Robust)
 
-Provide 10+ pairs of positive/negative texts. The DPO optimizer finds the direction that maximally separates them.
+Provide 10+ pairs of positive/negative texts. The Contrastive optimizer finds the direction that maximally separates them.
 
 ```bash
 python lens_factory.py text-pairs pairs.json --concept mystyle --target zimage
@@ -445,11 +445,11 @@ python lens_factory.py few-shot ./positive/ --negative ./negative/ --concept my_
 Generate a lens via Sparse Autoencoder decomposition of the residual stream:
 
 ```bash
-# SAE + DPO (recommended)
+# SAE + Contrastive (recommended)
 python lens_factory.py sae cinematic --target zimage
 
-# SAE only (no DPO refinement)
-python lens_factory.py sae cinematic --no-refine-dpo
+# SAE only (no contrastive refinement)
+python lens_factory.py sae cinematic --no-refine-contrastive
 
 # Custom settings
 python lens_factory.py sae cinematic --sae-features 50 --layer 25 --sae-epochs 300
@@ -464,10 +464,10 @@ python lens_factory.py sae ethereal --sae-load ./sae_layer22.pt
 Generate all built-in presets at once:
 
 ```bash
-# DPO (fast)
+# Contrastive (fast)
 python lens_factory.py batch-all --target zimage --steps 5000
 
-# SAE + DPO (interpretable)
+# SAE + Contrastive (interpretable)
 python lens_factory.py batch-all --target zimage --method sae
 ```
 
@@ -525,9 +525,9 @@ The bad pair would learn "mountain vs cat" rather than "cinematic vs not cinemat
 
 ### Is this related to SAEs (Sparse Autoencoders)?
 
-Yes — deeply. The `sae` training mode hooks into the text encoder's residual stream (intermediate hidden states), trains a Sparse Autoencoder with 8x expansion to decompose activations into ~20,000 interpretable features, then finds which features fire differentially for the concept. The result is a direction built from specific, identifiable features — unlike pure DPO which gives an opaque direction.
+Yes — deeply. The `sae` training mode hooks into the text encoder's residual stream (intermediate hidden states), trains a Sparse Autoencoder with 8x expansion to decompose activations into ~20,000 interpretable features, then finds which features fire differentially for the concept. The result is a direction built from specific, identifiable features — unlike pure Contrastive which gives an opaque direction.
 
-The DPO mode is a faster alternative that operates only on output embeddings. The recommended approach is `sae` mode with DPO refinement (`--method sae`), which gives you interpretable features AND robust separation.
+The Contrastive mode is a faster alternative that operates only on output embeddings. The recommended approach is `sae` mode with contrastive refinement (`--method sae`), which gives you interpretable features AND robust separation.
 
 See [SAE Mode](#sae-mode) for the full pipeline.
 
@@ -541,7 +541,7 @@ Core ideas this builds on:
 - **Linear Representation Hypothesis**: Neel Nanda et al., "Actually, Othello-GPT Has a Linear Emergent World Representation" (2023) — the foundational insight that concepts are linear directions in hidden states
 - **Steering Vectors / Activation Addition**: Turner et al., "Activation Addition: Steering Language Models Without Optimization" (2023) — the technique of adding direction vectors to steer model behavior, which is exactly what Concept Steer does
 - **Concept Activation Vectors (TCAVs)**: Kim et al., "Interpretability Beyond Feature Attribution" (ICML 2018) — the original idea of learning concept directions from contrastive examples
-- **DPO for Alignment**: Rafailov et al., "Direct Preference Optimization" (2023) — the loss function we adapted for direction training
+- **Contrastive for Alignment**: Rafailov et al., "Paired Margin Optimization" (2023) — the loss function we adapted for direction training
 - **Sparse Autoencoders for Interpretability**: Bricken et al., "Towards Monosemanticity" (Anthropic, 2023) — the SAE architecture and training methodology we use for feature decomposition
 - **Representation Engineering**: Zou et al., "Representation Engineering" (2023) — reading and writing to model representations for controllable behavior
 

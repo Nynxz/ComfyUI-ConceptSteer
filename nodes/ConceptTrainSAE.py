@@ -3,7 +3,7 @@ ConceptTrainSAE — Train an SAE-based concept lens from text pairs within Comfy
 
 Hooks into the text encoder's residual stream, trains a Sparse Autoencoder to
 decompose activations into interpretable features, then identifies which features
-define the concept. Optionally blends with DPO for robust separation.
+define the concept. Optionally blends with contrastive optimization for robust separation.
 
 This produces an interpretable lens where you can see exactly which SAE features
 define your concept.
@@ -54,7 +54,7 @@ class ConceptTrainSAENode(io.ComfyNode):
                 "Train a concept direction via Sparse Autoencoder decomposition "
                 "of the text encoder's residual stream. Produces an interpretable "
                 "lens showing which features define the concept. "
-                "Slower (~5min) but more informative than DPO alone."
+                "Slower (~5min) but more informative than contrastive alone."
             ),
             category="Concept Steer",
             inputs=[
@@ -133,20 +133,20 @@ class ConceptTrainSAENode(io.ComfyNode):
                     tooltip="Number of diverse prompts for SAE activation collection",
                 ),
                 io.Boolean.Input(
-                    "refine_dpo",
+                    "refine_contrastive",
                     default=True,
                     tooltip=(
-                        "Also run DPO on output embeddings and blend with SAE direction. "
+                        "Also run contrastive optimization on output embeddings and blend with SAE direction. "
                         "Recommended for best results."
                     ),
                 ),
                 io.Int.Input(
-                    "dpo_steps",
-                    default=5000,
+                    "contrastive_steps",
+                    default=500,
                     min=500,
                     max=20000,
                     step=500,
-                    tooltip="DPO optimization steps (only used if refine_dpo is enabled)",
+                    tooltip="Contrastive optimization steps (only used if refine_contrastive is enabled)",
                 ),
                 io.String.Input(
                     "sae_save_path",
@@ -160,8 +160,19 @@ class ConceptTrainSAENode(io.ComfyNode):
                     "sae_load_path",
                     default="",
                     tooltip=(
-                        "Load a pre-trained SAE instead of training a new one. "
-                        "Must match the same layer and expansion ratio."
+                        "Load a pre-trained SAE/transcoder instead of training a new one. "
+                        "Supports both native .pt SAE and .safetensors transcoder formats."
+                    ),
+                ),
+                io.String.Input(
+                    "transcoder_repo",
+                    default="",
+                    tooltip=(
+                        "HuggingFace repo for pretrained transcoders "
+                        "(e.g. 'mwhanna/qwen3-4b-transcoders'). "
+                        "Downloads a 64x expansion transcoder with 163,840 features "
+                        "trained on ~1B tokens. Much better than training a small SAE. "
+                        "Leave empty to train your own SAE."
                     ),
                 ),
                 io.String.Input(
@@ -176,6 +187,14 @@ class ConceptTrainSAENode(io.ComfyNode):
                     "output_dir",
                     default="",
                     tooltip="Override output directory for the lens file",
+                ),
+                io.Boolean.Input(
+                    "protect_existing",
+                    default=True,
+                    tooltip=(
+                        "If the output lens file already exists, save as _v2, _v3, … "
+                        "instead of overwriting. Disable only when intentionally replacing."
+                    ),
                 ),
             ],
             outputs=[
@@ -194,12 +213,14 @@ class ConceptTrainSAENode(io.ComfyNode):
         sae_epochs: int = 200,
         sae_features: int = 30,
         n_prompts: int = 500,
-        refine_dpo: bool = True,
-        dpo_steps: int = 5000,
+        refine_contrastive: bool = True,
+        contrastive_steps: int = 5000,
         sae_save_path: str = "",
         sae_load_path: str = "",
+        transcoder_repo: str = "",
         encoder_path: str = "",
         output_dir: str = "",
+        protect_existing: bool = True,
     ):
         # ── Validate inputs ──
         pos_lines = _parse_multiline(positive_texts)
@@ -259,12 +280,14 @@ class ConceptTrainSAENode(io.ComfyNode):
                 sae_epochs=sae_epochs,
                 n_activation_prompts=n_prompts,
                 top_k=sae_features,
-                refine_dpo=refine_dpo,
-                dpo_steps=dpo_steps,
+                refine_contrastive=refine_contrastive,
+                contrastive_steps=contrastive_steps,
                 include_bridge=True,
                 output_dir=out,
                 sae_save_path=sae_save,
                 sae_load_path=sae_load,
+                transcoder_repo=transcoder_repo.strip() or None,
+                overwrite=(not protect_existing),
             )
             elapsed = time.time() - t0
             _log(f"SAE lens trained in {elapsed:.1f}s → {lens_path}")

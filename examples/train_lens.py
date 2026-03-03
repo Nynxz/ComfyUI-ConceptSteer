@@ -42,8 +42,10 @@ sys.path.insert(0, str(TOOLS_DIR))
 # └──────────────────────────────────────────────────────────────────────────┘
 
 # Path to your Qwen 3.4B text encoder weights
+# Set this to the location of your qwen_3_4b.safetensors file.
+# If left empty, the factory will auto-discover from ComfyUI/models/text_encoders/
 os.environ["QWEN_ENCODER_PATH"] = (
-    "/run/media/user/Turbo/Models/text_encoders/qwen_3_4b.safetensors"
+    ""  # e.g. "/path/to/models/text_encoders/qwen_3_4b.safetensors"
 )
 
 # Where trained lenses go (default: comfyui-conceptsteer/lenses/)
