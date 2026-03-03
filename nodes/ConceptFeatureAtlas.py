@@ -317,6 +317,14 @@ class ConceptFeatureAtlasNode(io.ComfyNode):
                         "50K is a good balance for 20K features."
                     ),
                 ),
+                io.Boolean.Input(
+                    "protect_existing",
+                    default=True,
+                    tooltip=(
+                        "If the save path already exists, auto-rename to _v2, _v3, … "
+                        "instead of overwriting. Disable only when intentionally replacing."
+                    ),
+                ),
             ],
             outputs=[
                 io.String.Output("atlas_path"),
@@ -338,6 +346,7 @@ class ConceptFeatureAtlasNode(io.ComfyNode):
         encoder_path: str = "",
         cached_activations_path: str = "",
         max_cached_vectors: int = 50000,
+        protect_existing: bool = True,
     ):
         sae_path = sae_path.strip()
         save_path = save_path.strip()
@@ -747,6 +756,15 @@ class ConceptFeatureAtlasNode(io.ComfyNode):
         # ── Save ──
         save_obj = Path(save_path)
         save_obj.parent.mkdir(parents=True, exist_ok=True)
+        if protect_existing and save_obj.exists():
+            v = 2
+            while True:
+                candidate = save_obj.parent / f"{save_obj.stem}_v{v}{save_obj.suffix}"
+                if not candidate.exists():
+                    _log(f"File exists — saving as '{candidate.name}' (protect_existing=True)")
+                    save_obj = candidate
+                    break
+                v += 1
 
         with open(save_obj, "w") as f:
             json.dump(atlas, f, indent=2)

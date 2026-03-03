@@ -188,6 +188,14 @@ class ConceptTrainSAENode(io.ComfyNode):
                     default="",
                     tooltip="Override output directory for the lens file",
                 ),
+                io.Boolean.Input(
+                    "protect_existing",
+                    default=True,
+                    tooltip=(
+                        "If the output lens file already exists, save as _v2, _v3, … "
+                        "instead of overwriting. Disable only when intentionally replacing."
+                    ),
+                ),
             ],
             outputs=[
                 io.String.Output("lens_path"),
@@ -212,6 +220,7 @@ class ConceptTrainSAENode(io.ComfyNode):
         transcoder_repo: str = "",
         encoder_path: str = "",
         output_dir: str = "",
+        protect_existing: bool = True,
     ):
         # ── Validate inputs ──
         pos_lines = _parse_multiline(positive_texts)
@@ -278,6 +287,7 @@ class ConceptTrainSAENode(io.ComfyNode):
                 sae_save_path=sae_save,
                 sae_load_path=sae_load,
                 transcoder_repo=transcoder_repo.strip() or None,
+                overwrite=(not protect_existing),
             )
             elapsed = time.time() - t0
             _log(f"SAE lens trained in {elapsed:.1f}s → {lens_path}")

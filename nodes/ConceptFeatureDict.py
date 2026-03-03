@@ -103,6 +103,14 @@ class ConceptFeatureDictNode(io.ComfyNode):
                     default="",
                     tooltip="Path to Qwen encoder safetensors (or set env var)",
                 ),
+                io.Boolean.Input(
+                    "protect_existing",
+                    default=True,
+                    tooltip=(
+                        "If the save path already exists, auto-rename to _v2, _v3, … "
+                        "instead of overwriting. Disable only when intentionally replacing."
+                    ),
+                ),
             ],
             outputs=[
                 io.String.Output("dict_path"),
@@ -120,6 +128,7 @@ class ConceptFeatureDictNode(io.ComfyNode):
         top_prompts: int = 5,
         n_extra_prompts: int = 100,
         encoder_path: str = "",
+        protect_existing: bool = True,
     ):
         import torch
 
@@ -327,6 +336,15 @@ class ConceptFeatureDictNode(io.ComfyNode):
         # ── Save ──
         save_obj = Path(save_path)
         save_obj.parent.mkdir(parents=True, exist_ok=True)
+        if protect_existing and save_obj.exists():
+            v = 2
+            while True:
+                candidate = save_obj.parent / f"{save_obj.stem}_v{v}{save_obj.suffix}"
+                if not candidate.exists():
+                    _log(f"File exists — saving as '{candidate.name}' (protect_existing=True)")
+                    save_obj = candidate
+                    break
+                v += 1
 
         output = {
             "sae_path": sae_path,

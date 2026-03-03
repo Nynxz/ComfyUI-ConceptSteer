@@ -211,6 +211,29 @@ class ConceptTrainSAEOnlyNode(io.ComfyNode):
                         "Leave empty to use QWEN_ENCODER_PATH env var."
                     ),
                 ),
+                io.Int.Input(
+                    "seed",
+                    default=-1,
+                    min=-1,
+                    max=0xFFFFFFFF,
+                    tooltip=(
+                        "Random seed for reproducible feature dictionaries.\n"
+                        "-1 = random (different features each run).\n"
+                        "Set a fixed value (e.g. 42) to get the same feature\n"
+                        "indices every time you retrain with the same data and\n"
+                        "hyperparameters. Write the seed down alongside your\n"
+                        "saved feature indices!"
+                    ),
+                ),
+                io.Boolean.Input(
+                    "protect_existing",
+                    default=True,
+                    tooltip=(
+                        "If the save path already exists, auto-rename to _v2, _v3, … "
+                        "instead of overwriting. Disable only when you intentionally "
+                        "want to replace the file."
+                    ),
+                ),
             ],
             outputs=[
                 io.String.Output("sae_path"),
@@ -233,8 +256,24 @@ class ConceptTrainSAEOnlyNode(io.ComfyNode):
         hf_dataset: str = "HuggingFaceFW/fineweb",
         hf_subset: str = "sample-10BT",
         encoder_path: str = "",
+        seed: int = -1,
+        protect_existing: bool = True,
     ):
         import torch
+
+        # ── Seed ──
+        if seed >= 0:
+            torch.manual_seed(seed)
+            try:
+                import numpy as np
+                np.random.seed(seed & 0xFFFFFFFF)
+            except ImportError:
+                pass
+            import random
+            random.seed(seed)
+            _log(f"Random seed: {seed}")
+        else:
+            _log("No seed set — training will produce different features each run")
 
         save_path = save_path.strip()
         if not save_path:
@@ -334,6 +373,15 @@ class ConceptTrainSAEOnlyNode(io.ComfyNode):
         # ── Save ──
         save_path_obj = Path(save_path)
         save_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        if protect_existing and save_path_obj.exists():
+            v = 2
+            while True:
+                candidate = save_path_obj.parent / f"{save_path_obj.stem}_v{v}{save_path_obj.suffix}"
+                if not candidate.exists():
+                    _log(f"File exists — saving as '{candidate.name}' (protect_existing=True)")
+                    save_path_obj = candidate
+                    break
+                v += 1
         torch.save(sae_model.state_dict(), save_path_obj)
 
         elapsed = time.time() - t0

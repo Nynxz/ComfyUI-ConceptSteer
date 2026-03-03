@@ -138,6 +138,14 @@ class ConceptTrainFewShotNode(io.ComfyNode):
                     default="",
                     tooltip="Override output directory for the lens file",
                 ),
+                io.Boolean.Input(
+                    "protect_existing",
+                    default=True,
+                    tooltip=(
+                        "If the output lens file already exists, save as _v2, _v3, … "
+                        "instead of overwriting. Disable only when intentionally replacing."
+                    ),
+                ),
             ],
             outputs=[
                 io.String.Output("lens_path"),
@@ -157,6 +165,7 @@ class ConceptTrainFewShotNode(io.ComfyNode):
         encoder_path: str = "",
         transcoder_repo: str = "",
         output_dir: str = "",
+        protect_existing: bool = True,
     ):
         # ── Validate inputs ──
         pos_path = positive_dir.strip()
@@ -208,6 +217,7 @@ class ConceptTrainFewShotNode(io.ComfyNode):
                 vl_model=vl_model.strip() or None,
                 output_dir=out,
                 transcoder_repo=transcoder_repo.strip() or None,
+                overwrite=(not protect_existing),
             )
             elapsed = time.time() - t0
             _log(f"Few-shot lens trained in {elapsed:.1f}s → {lens_path}")

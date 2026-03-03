@@ -357,6 +357,14 @@ class ConceptDiffFeaturesNode(io.ComfyNode):
                         "When provided, differential features are labeled."
                     ),
                 ),
+                io.Boolean.Input(
+                    "protect_existing",
+                    default=True,
+                    tooltip=(
+                        "If the lens file already exists (save_lens=True), "
+                        "save as _v2, _v3, … instead of overwriting."
+                    ),
+                ),
             ],
             outputs=[
                 io.Image.Output("VISUALIZATION"),
@@ -380,6 +388,7 @@ class ConceptDiffFeaturesNode(io.ComfyNode):
         save_lens: bool = False,
         lens_name: str = "diff_discovery",
         dict_path: str = "",
+        protect_existing: bool = True,
     ):
         import json as _json
 
@@ -659,6 +668,15 @@ class ConceptDiffFeaturesNode(io.ComfyNode):
             lens_dir = _PACKAGE_ROOT / "lenses" / "discoveries"
             lens_dir.mkdir(parents=True, exist_ok=True)
             lens_path = lens_dir / f"{lens_name}.pt"
+            if protect_existing and lens_path.exists():
+                v = 2
+                while True:
+                    candidate = lens_dir / f"{lens_name}_v{v}.pt"
+                    if not candidate.exists():
+                        _log(f"File exists — saving as '{candidate.name}' (protect_existing=True)")
+                        lens_path = candidate
+                        break
+                    v += 1
             torch.save(lens_data, lens_path)
             _log(f"Saved differential lens to {lens_path}")
             text_output += f"\n\nLens saved: {lens_path}"
