@@ -66,6 +66,22 @@ SIGLIP_DIM = 768
 QWEN_HIDDEN_DIM = 2560
 
 
+# ── File-overwrite protection ─────────────────────────────────────────────────
+
+def _versioned_path(path: Path) -> Path:
+    """Return path unchanged if it doesn't exist, else find _v2/_v3/… that is free."""
+    if not path.exists():
+        return path
+    stem, suffix, parent = path.stem, path.suffix, path.parent
+    v = 2
+    while True:
+        candidate = parent / f"{stem}_v{v}{suffix}"
+        if not candidate.exists():
+            print(f"[lens_factory] '{path.name}' exists — saving as '{candidate.name}'")
+            return candidate
+        v += 1
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  Core Direction Training
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1631,6 +1647,7 @@ def generate_lens_from_text_pairs(
     include_bridge: bool = True,
     output_dir: Optional[Path] = None,
     contrastive_steps: int = 500,
+    overwrite: bool = True,
 ) -> Path:
     """Generate a lens from explicit positive/negative text pairs.
 
@@ -1754,6 +1771,8 @@ def generate_lens_from_text_pairs(
     out_dir.mkdir(parents=True, exist_ok=True)
     lens_name = f"{concept}_{target}_contrastive"
     lens_path = out_dir / f"{lens_name}.pt"
+    if not overwrite:
+        lens_path = _versioned_path(lens_path)
     torch.save(lens_data, lens_path)
 
     # Metadata JSON
@@ -1791,6 +1810,7 @@ def generate_lens_from_images(
     vl_model: Optional[str] = None,
     output_dir: Optional[Path] = None,
     transcoder_repo: Optional[str] = None,
+    overwrite: bool = True,
 ) -> Path:
     """Generate a lens from few-shot example images.
 
@@ -1993,6 +2013,8 @@ def generate_lens_from_images(
 
     out_dir.mkdir(parents=True, exist_ok=True)
     lens_path = out_dir / f"{lens_name}.pt"
+    if not overwrite:
+        lens_path = _versioned_path(lens_path)
     torch.save(lens_data, lens_path)
 
     meta = {
@@ -2356,6 +2378,7 @@ def generate_lens_sae(
     sae_save_path: Optional[Path] = None,
     sae_load_path: Optional[Path] = None,
     transcoder_repo: Optional[str] = None,
+    overwrite: bool = True,
 ) -> Path:
     """Generate a lens using SAE feature decomposition of the residual stream.
 
@@ -2625,6 +2648,8 @@ def generate_lens_sae(
     method_suffix = f"{method_base}_contrastive" if refine_contrastive else method_base
     lens_name = f"{concept}_{target}_{method_suffix}"
     lens_path = out_dir / f"{lens_name}.pt"
+    if not overwrite:
+        lens_path = _versioned_path(lens_path)
 
     lens_data = {
         "direction": final_direction,
