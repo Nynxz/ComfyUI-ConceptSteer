@@ -17,3 +17,4 @@ DisplayName = "Concept Steer"
 Icon = ""
 Description = "Steer image generation toward learned concepts (cinematic, ethereal, etc.) using SAE/contrastive direction vectors. No LoRA, no fine-tuning — just plug in a lens and adjust strength."
 includes = ["js", "docs"]
+Repository = "https://github.com/Nynxz/ComfyUI-ConceptSteer"
